@@ -56,3 +56,7 @@ mode = "non-interactive"   # or "interactive" (the default)
 ```
 
 The flag wins over workspace config, and workspace config wins over global.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
