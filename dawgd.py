@@ -4,11 +4,13 @@
 Subcommands:
   dawgd.py serve                     run the reply server (Tailscale-only)
   dawgd.py ask [opts] MESSAGE OPT..  send a request with reply options
+  dawgd.py ask [opts] --questions F  send several questions behind one link
 
 A request is a notification whose tap opens a page with one button per
-option. Options whose name matches an action in actions.toml run that
-action's fixed command when chosen; other options are just recorded so a
-waiting script can read them.
+option. A request with several questions shows them one at a time, then
+a review step, and returns all the answers together. Options whose name
+matches an action in actions.toml run that action's fixed command when
+chosen; other options are just recorded so a waiting script can read them.
 
 Files:
   ~/.config/dawg/actions.toml   documented action keys -> fixed commands
@@ -121,6 +123,10 @@ def ans_path(rid):
     return STATE_DIR / f"{rid}.answer.json"
 
 
+def draft_path(rid):
+    return STATE_DIR / f"{rid}.draft.json"
+
+
 def valid_id(rid):
     return rid.isalnum() and 16 <= len(rid) <= 64
 
@@ -128,12 +134,29 @@ def valid_id(rid):
 def load_request(rid):
     if not valid_id(rid) or not req_path(rid).exists():
         return None
-    return json.loads(req_path(rid).read_text())
+    req = json.loads(req_path(rid).read_text())
+    if "questions" not in req:  # written before multi-question asks
+        req["questions"] = [{"message": req.pop("message"), "options": req.pop("options")}]
+    return req
 
 
 def load_answer(rid):
     p = ans_path(rid)
-    return json.loads(p.read_text()) if p.exists() else None
+    if not p.exists():
+        return None
+    ans = json.loads(p.read_text())
+    if "answers" not in ans:  # written before multi-question asks
+        ans = {"answers": [{"question": "", "option": ans["option"], "text": ans["text"],
+                            "result": ans["result"]}], "answered_at": ans["answered_at"]}
+    return ans
+
+
+def load_draft(rid, n):
+    """Answers so far and the question being shown; pos == n means review."""
+    p = draft_path(rid)
+    if p.exists():
+        return json.loads(p.read_text())
+    return {"pos": 0, "answers": [None] * n}
 
 
 def write_json(path, data):
@@ -163,6 +186,8 @@ h1{{font-size:20px;margin:0 0 8px}} .muted{{color:var(--muted);font-size:14px}}
 button{{display:block;width:100%;margin:10px 0 0;padding:14px;border:0;border-radius:10px;
 background:var(--accent);color:#fff;font-size:17px;font-weight:600}}
 button small{{display:block;font-weight:400;opacity:.85;font-size:13px}}
+button.alt{{background:var(--bg);color:var(--fg)}}
+hr{{border:0;border-top:1px solid var(--bg);margin:12px 0}}
 textarea{{width:100%;box-sizing:border-box;min-height:70px;margin-top:10px;padding:10px;border-radius:10px;
 border:1px solid var(--muted);background:var(--bg);color:var(--fg);font:inherit}}
 pre{{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:10px;border-radius:8px;font-size:13px}}
@@ -176,12 +201,14 @@ def fmt_time(ts):
     return time.strftime("%H:%M:%S", time.localtime(ts))
 
 
-def option_buttons(options, actions):
+def option_buttons(options, actions, chosen=None):
     parts = []
     for opt in options:
         hint = ""
         if opt in actions:
             hint = f"<small>runs: {e(actions[opt].get('description') or ' '.join(actions[opt]['command']))}</small>"
+        if opt == chosen:
+            hint += "<small>your earlier answer</small>"
         parts.append(f'<button name="option" value="{e(opt)}">{e(opt)}{hint}</button>')
     return "".join(parts)
 
@@ -253,50 +280,91 @@ class Handler(BaseHTTPRequestHandler):
             return self.not_found()
         actions = load_actions()
         ans = load_answer(rid)
-        head = (f'<h1>{e(req["title"])}</h1><div class="msg">{e(req["message"])}</div>'
-                f'<div class="muted">sent {fmt_time(req["created"])}</div>')
+        qs = req["questions"]
+        multi = len(qs) > 1
+        head = f'<h1>{e(req["title"])}</h1><div class="muted">sent {fmt_time(req["created"])}</div>'
         if ans:
-            body = (f'{head}<p>Answered <b>{e(ans["option"])}</b> at {fmt_time(ans["answered_at"])}</p>'
-                    + (f'<pre>{e(ans["text"])}</pre>' if ans.get("text") else "")
-                    + result_block(ans.get("result")))
+            parts = []
+            for q, a in zip(qs, ans["answers"]):
+                parts.append(f'<div class="msg">{e(q["message"])}</div><p>Answered <b>{e(a["option"])}</b></p>'
+                             + (f'<pre>{e(a["text"])}</pre>' if a.get("text") else "")
+                             + result_block(a.get("result")))
+            body = f'{head}{"<hr>".join(parts)}<p class="muted">Answered at {fmt_time(ans["answered_at"])}</p>'
         elif time.time() > req["expires"]:
-            body = f'{head}<p class="bad">Expired at {fmt_time(req["expires"])}.</p>'
+            body = f'{head}<div class="msg">{e(qs[0]["message"])}</div><p class="bad">Expired at {fmt_time(req["expires"])}.</p>'
         else:
-            text = send = ""
-            if req.get("allow_text"):
-                hint = "Add a note, or write your own instruction" if req["options"] else "Message"
-                label = "Do this instead" if req["options"] else "Send"
-                text = f'<textarea name="text" placeholder="{hint}"></textarea>'
-                send = f'<button name="option" value="{MESSAGE}">{label}</button>'
-            body = (f'{head}<form method="post">{text}{option_buttons(req["options"], actions)}{send}</form>'
-                    f'<p class="muted">Expires {fmt_time(req["expires"])}</p>')
+            draft = load_draft(rid, len(qs))
+            pos = draft["pos"]
+            back = '<button class="alt" name="back" value="1">Back</button>' if pos > 0 else ""
+            if pos == len(qs):
+                rows = "".join(f'<div class="msg">{e(q["message"])}</div><p><b>{e(a["option"])}</b></p>'
+                               + (f'<pre>{e(a["text"])}</pre>' if a.get("text") else "")
+                               for q, a in zip(qs, draft["answers"]))
+                form = f'<button name="submit" value="1">Submit</button>{back}'
+                body = f'{head}<p class="muted">Review your answers</p>{rows}<form method="post">{form}</form>'
+            else:
+                q, prev = qs[pos], draft["answers"][pos]
+                text = send = ""
+                if req.get("allow_text"):
+                    hint = "Add a note, or write your own instruction" if q["options"] else "Message"
+                    label = "Do this instead" if q["options"] else "Send"
+                    text = (f'<textarea name="text" placeholder="{hint}">'
+                            f'{e(prev["text"]) if prev else ""}</textarea>')
+                    send = f'<button name="option" value="{MESSAGE}">{label}</button>'
+                chosen = prev["option"] if prev else None
+                step = f'<p class="muted">Question {pos + 1} of {len(qs)}</p>' if multi else ""
+                form = (f'<input type="hidden" name="q" value="{pos}">{text}'
+                        f'{option_buttons(q["options"], actions, chosen)}{send}{back}')
+                body = f'{head}{step}<div class="msg">{e(q["message"])}</div><form method="post">{form}</form>'
+            body += f'<p class="muted">Expires {fmt_time(req["expires"])}</p>'
         self.send_page(req["title"], flash + f'<div class="card">{body}</div>')
 
     def answer_request(self, rid, form):
         req = load_request(rid)
         if not req:
             return self.not_found()
-        option = form.get("option", "")
-        text = form.get("text", "").strip()
-        if option == MESSAGE and req.get("allow_text"):
-            if not text:
-                return self.show_request(rid, '<div class="card bad">Write a message first.</div>')
-        elif option not in req["options"]:
-            return self.show_request(rid, '<div class="card bad">Unknown option.</div>')
+        qs = req["questions"]
         with answer_lock:
             if load_answer(rid):
                 return self.show_request(rid, '<div class="card bad">Already answered.</div>')
             if time.time() > req["expires"]:
                 return self.show_request(rid)
-            ans = {"option": option, "text": text,
-                   "answered_at": time.time(), "result": None}
+            draft = load_draft(rid, len(qs))
+            if form.get("back"):
+                draft["pos"] = max(draft["pos"] - 1, 0)
+                write_json(draft_path(rid), draft)
+                return self.show_request(rid)
+            if not form.get("submit"):
+                if form.get("q") != str(draft["pos"]) or draft["pos"] >= len(qs):
+                    return self.show_request(rid, '<div class="card bad">That page was out of date.</div>')
+                q = qs[draft["pos"]]
+                option = form.get("option", "")
+                text = form.get("text", "").strip()
+                if option == MESSAGE and req.get("allow_text"):
+                    if not text:
+                        return self.show_request(rid, '<div class="card bad">Write a message first.</div>')
+                elif option not in q["options"]:
+                    return self.show_request(rid, '<div class="card bad">Unknown option.</div>')
+                draft["answers"][draft["pos"]] = {"question": q["message"], "option": option,
+                                                  "text": text, "result": None}
+                draft["pos"] += 1
+                write_json(draft_path(rid), draft)
+                # A single question needs no review step.
+                if len(qs) > 1:
+                    return self.show_request(rid)
+            elif draft["pos"] != len(qs):
+                return self.show_request(rid, '<div class="card bad">That page was out of date.</div>')
+            ans = {"answers": draft["answers"], "answered_at": time.time()}
             write_json(ans_path(rid), ans)
+            draft_path(rid).unlink(missing_ok=True)
         actions = load_actions()
-        if option != MESSAGE and option in actions:
-            ans["result"] = run_action(option, actions[option], self.server.settings["max_output"])
-            write_json(ans_path(rid), ans)
-            r = ans["result"]
-            notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"])
+        for a in ans["answers"]:
+            option = a["option"]
+            if option != MESSAGE and option in actions:
+                a["result"] = run_action(option, actions[option], self.server.settings["max_output"])
+                write_json(ans_path(rid), ans)
+                r = a["result"]
+                notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"])
         self.show_request(rid)
 
     # -- standing actions (bookmarkable)
@@ -332,29 +400,55 @@ def serve(_args):
 
 # ---------------------------------------------------------------- ask
 
+def read_questions(args):
+    if args.questions is None:
+        if args.message is None:
+            sys.exit("dawg ask: give a message, or --questions")
+        return [{"message": args.message, "options": args.options}]
+    if args.message is not None:
+        sys.exit("dawg ask: give a message or --questions, not both")
+    src = sys.stdin.read() if args.questions == "-" else Path(args.questions).read_text()
+    try:
+        qs = json.loads(src)
+    except json.JSONDecodeError as err:
+        sys.exit(f"dawg ask: --questions is not valid JSON: {err}")
+    if not isinstance(qs, list) or not qs:
+        sys.exit("dawg ask: --questions must be a non-empty JSON list")
+    for q in qs:
+        if (not isinstance(q, dict) or not isinstance(q.get("message"), str)
+                or not all(isinstance(o, str) for o in q.setdefault("options", []))):
+            sys.exit('dawg ask: each question needs "message" (string) and optional "options" (strings)')
+    return [{"message": q["message"], "options": q["options"]} for q in qs]
+
+
 def ask(args):
     settings = load_settings()
     if not settings["base_url"]:
         sys.exit(f"dawg ask: set base_url in {SETTINGS_FILE} (run install.sh)")
     actions = load_actions()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if not args.options and not args.text:
-        sys.exit("dawg ask: give at least one option, or --text")
-    if len(set(args.options)) != len(args.options):
-        sys.exit("dawg ask: duplicate options")
-    if MESSAGE in args.options:
-        sys.exit(f"dawg ask: {MESSAGE!r} is reserved for free-text replies")
+    qs = read_questions(args)
+    for q in qs:
+        if not q["options"] and not args.text:
+            sys.exit("dawg ask: give each question at least one option, or --text")
+        if len(set(q["options"])) != len(q["options"]):
+            sys.exit("dawg ask: duplicate options")
+        if MESSAGE in q["options"]:
+            sys.exit(f"dawg ask: {MESSAGE!r} is reserved for free-text replies")
     rid = secrets.token_hex(16)
     now = time.time()
-    req = {"id": rid, "title": args.title, "message": args.message, "options": args.options,
+    req = {"id": rid, "title": args.title, "questions": qs,
            "allow_text": args.text, "created": now, "expires": now + args.expires}
     write_json(req_path(rid), req)
-    runs = [o for o in args.options if o in actions]
-    hint = "Tap to reply" + (": " + " / ".join(args.options) if args.options else "")
+    first = qs[0]
+    if len(qs) > 1:
+        body = f"{len(qs)} questions. 1: {first['message']}\nTap to answer them one at a time"
+    else:
+        body = f"{first['message']}\nTap to reply" + (": " + " / ".join(first["options"]) if first["options"] else "")
+    runs = sorted({o for q in qs for o in q["options"] if o in actions})
     if runs:
-        hint += f"  (runs: {', '.join(runs)})"
-    if not notify(args.title, f"{args.message}\n{hint}", url=f"{settings['base_url']}/r/{rid}",
-                  group=args.group):
+        body += f"  (runs: {', '.join(runs)})"
+    if not notify(args.title, body, url=f"{settings['base_url']}/r/{rid}", group=args.group):
         req_path(rid).unlink(missing_ok=True)
         print("dawg ask: notification not sent; nothing to wait for", file=sys.stderr)
         return 4
@@ -365,16 +459,25 @@ def ask(args):
     while time.time() < deadline:
         ans = load_answer(rid)
         if ans:
-            # Give an action a moment to finish so --json can include its result.
-            if ans["option"] != MESSAGE and ans["option"] in actions and ans["result"] is None:
+            # Give actions a moment to finish so --json can include their results.
+            if any(a["option"] != MESSAGE and a["option"] in actions and a["result"] is None
+                   for a in ans["answers"]):
                 time.sleep(1)
                 continue
-            if args.json:
+            if len(qs) == 1:
+                a = ans["answers"][0]
+                if args.json:
+                    print(json.dumps({"option": a["option"], "text": a["text"],
+                                      "answered_at": ans["answered_at"], "result": a["result"]}))
+                else:
+                    print(a["option"])
+                    if a.get("text"):
+                        print(a["text"])
+            elif args.json:
                 print(json.dumps(ans))
             else:
-                print(ans["option"])
-                if ans.get("text"):
-                    print(ans["text"])
+                print("\n\n".join(a["option"] + (f"\n{a['text']}" if a.get("text") else "")
+                                   for a in ans["answers"]))
             return 0
         time.sleep(1)
     print("dawg ask: expired without an answer", file=sys.stderr)
@@ -394,7 +497,10 @@ def main():
     a.add_argument("--json", action="store_true", help="with --wait, print the full answer as JSON")
     a.add_argument("--text", action="store_true",
                    help=f"allow a typed reply: a note with an option, or option {MESSAGE!r} on its own")
-    a.add_argument("message")
+    a.add_argument("--questions", metavar="FILE",
+                   help='several questions in one ask, answered one at a time: a JSON list of '
+                        '{"message": ..., "options": [...]} ("-" reads stdin)')
+    a.add_argument("message", nargs="?")
     a.add_argument("options", nargs="*")
     a.set_defaults(func=ask)
     args = p.parse_args()

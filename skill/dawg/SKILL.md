@@ -49,6 +49,11 @@ locked while the user is active over SSH.
   - On `That's all`, stop and wait. Away mode stays on until they're back.
 - **While away (non-interactive):** send one-way `dawg` messages for
   milestones and completion.
+- **Plan mode:** a phone reply can't take you out of plan mode. Only the
+  terminal approval prompt can. If away mode starts in plan mode, say so in
+  the terminal. When the user approves a plan by phone, finish everything
+  plan mode allows. Then ask for approval and send an ask saying the approval
+  is waiting in the terminal.
 - **Exit** when any new message arrives in the terminal: the user is back.
   Stop the pending background `dawg ask` (TaskStop), say in the terminal that
   away mode is off, and handle any open question there. A phone reply like
@@ -90,6 +95,24 @@ dawg ask -t "<project>" -g claude --text -w --json -e 3600 "Question?" [OPTION..
   and wait for the terminal.
 - `-e` is the expiry in seconds. Use longer (e.g. `14400`) if the user said
   they'll be gone a while.
+
+## Several questions at once
+
+When you have more than one question, send them all in one ask, never
+several asks. The page shows them one at a time, with Back, then a review
+step before they submit:
+
+```bash
+dawg ask -t "<project>" -g claude --text -w --json -e 3600 --questions - <<'EOF'
+[{"message": "Which database?", "options": ["Postgres", "SQLite"]},
+ {"message": "Add auth now?", "options": ["Yes", "Later"]},
+ {"message": "Anything else?"}]
+EOF
+```
+
+`--json` then prints `{"answers": [...], "answered_at": ...}` with one
+`{"question", "option", "text", "result"}` per question, in order. Read each
+the same way as a single answer.
 
 ## Send a message without a reply (non-interactive only)
 

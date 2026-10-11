@@ -41,6 +41,7 @@ dawg "build finished"                                  # one-way message
 dawg run -- make test                                  # notify when a command ends
 dawg ask --text -w --json "Deploy now?" Yes No         # ask, wait for the reply
 dawg ask --text -w --json "What next?"                 # open question, typed reply
+dawg ask --text -w --json --questions qs.json          # several questions, one link
 ```
 
 To use the skill, tell the agent you're stepping away, or run `/dawg`. It
