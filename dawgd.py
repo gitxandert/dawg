@@ -39,6 +39,9 @@ SETTINGS_FILE = CONFIG_DIR / "dawgd.toml"
 TOKEN_FILE = CONFIG_DIR / "token"
 DAWG = shutil.which("dawg") or str(Path(__file__).with_name("dawg"))
 
+# Option recorded when the user sends their own message instead of a listed option.
+MESSAGE = "message"
+
 DEFAULT_SETTINGS = {
     "bind": "127.0.0.1",
     "port": 8787,
@@ -81,7 +84,10 @@ def notify(title, body, url=None, group="dawgd"):
     cmd = [DAWG, "-t", title, "-g", group]
     if url:
         cmd += ["-u", url]
-    subprocess.run(cmd + [body], check=False, timeout=20)
+    try:
+        return subprocess.run(cmd + [body], check=False, timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def run_action(key, action, max_output):
@@ -256,9 +262,13 @@ class Handler(BaseHTTPRequestHandler):
         elif time.time() > req["expires"]:
             body = f'{head}<p class="bad">Expired at {fmt_time(req["expires"])}.</p>'
         else:
-            text = ('<textarea name="text" placeholder="Optional note"></textarea>'
-                    if req.get("allow_text") else "")
-            body = (f'{head}<form method="post">{text}{option_buttons(req["options"], actions)}</form>'
+            text = send = ""
+            if req.get("allow_text"):
+                hint = "Add a note, or write your own instruction" if req["options"] else "Message"
+                label = "Do this instead" if req["options"] else "Send"
+                text = f'<textarea name="text" placeholder="{hint}"></textarea>'
+                send = f'<button name="option" value="{MESSAGE}">{label}</button>'
+            body = (f'{head}<form method="post">{text}{option_buttons(req["options"], actions)}{send}</form>'
                     f'<p class="muted">Expires {fmt_time(req["expires"])}</p>')
         self.send_page(req["title"], flash + f'<div class="card">{body}</div>')
 
@@ -267,18 +277,22 @@ class Handler(BaseHTTPRequestHandler):
         if not req:
             return self.not_found()
         option = form.get("option", "")
-        if option not in req["options"]:
+        text = form.get("text", "").strip()
+        if option == MESSAGE and req.get("allow_text"):
+            if not text:
+                return self.show_request(rid, '<div class="card bad">Write a message first.</div>')
+        elif option not in req["options"]:
             return self.show_request(rid, '<div class="card bad">Unknown option.</div>')
         with answer_lock:
             if load_answer(rid):
                 return self.show_request(rid, '<div class="card bad">Already answered.</div>')
             if time.time() > req["expires"]:
                 return self.show_request(rid)
-            ans = {"option": option, "text": form.get("text", "").strip(),
+            ans = {"option": option, "text": text,
                    "answered_at": time.time(), "result": None}
             write_json(ans_path(rid), ans)
         actions = load_actions()
-        if option in actions:
+        if option != MESSAGE and option in actions:
             ans["result"] = run_action(option, actions[option], self.server.settings["max_output"])
             write_json(ans_path(rid), ans)
             r = ans["result"]
@@ -324,19 +338,26 @@ def ask(args):
         sys.exit(f"dawg ask: set base_url in {SETTINGS_FILE} (run install.sh)")
     actions = load_actions()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not args.options and not args.text:
+        sys.exit("dawg ask: give at least one option, or --text")
     if len(set(args.options)) != len(args.options):
         sys.exit("dawg ask: duplicate options")
+    if MESSAGE in args.options:
+        sys.exit(f"dawg ask: {MESSAGE!r} is reserved for free-text replies")
     rid = secrets.token_hex(16)
     now = time.time()
     req = {"id": rid, "title": args.title, "message": args.message, "options": args.options,
            "allow_text": args.text, "created": now, "expires": now + args.expires}
     write_json(req_path(rid), req)
     runs = [o for o in args.options if o in actions]
-    hint = "Tap to reply: " + " / ".join(args.options)
+    hint = "Tap to reply" + (": " + " / ".join(args.options) if args.options else "")
     if runs:
         hint += f"  (runs: {', '.join(runs)})"
-    notify(args.title, f"{args.message}\n{hint}", url=f"{settings['base_url']}/r/{rid}",
-           group=args.group)
+    if not notify(args.title, f"{args.message}\n{hint}", url=f"{settings['base_url']}/r/{rid}",
+                  group=args.group):
+        req_path(rid).unlink(missing_ok=True)
+        print("dawg ask: notification not sent; nothing to wait for", file=sys.stderr)
+        return 4
     if not args.wait:
         print(rid)
         return 0
@@ -345,7 +366,7 @@ def ask(args):
         ans = load_answer(rid)
         if ans:
             # Give an action a moment to finish so --json can include its result.
-            if ans["option"] in actions and ans["result"] is None:
+            if ans["option"] != MESSAGE and ans["option"] in actions and ans["result"] is None:
                 time.sleep(1)
                 continue
             if args.json:
@@ -371,9 +392,10 @@ def main():
     a.add_argument("-e", "--expires", type=int, default=3600, help="seconds (default 3600)")
     a.add_argument("-w", "--wait", action="store_true", help="block until answered; print the option")
     a.add_argument("--json", action="store_true", help="with --wait, print the full answer as JSON")
-    a.add_argument("--text", action="store_true", help="allow a free-text note with the reply")
+    a.add_argument("--text", action="store_true",
+                   help=f"allow a typed reply: a note with an option, or option {MESSAGE!r} on its own")
     a.add_argument("message")
-    a.add_argument("options", nargs="+")
+    a.add_argument("options", nargs="*")
     a.set_defaults(func=ask)
     args = p.parse_args()
     sys.exit(args.func(args) or 0)

@@ -69,17 +69,23 @@ Tell the user in the terminal instead of asking questions you can't receive.
 ## Ask and wait for a reply
 
 ```bash
-dawg ask -t "<project>" -g claude --text -w --json -e 3600 "Question?" Reply
+dawg ask -t "<project>" -g claude --text -w --json -e 3600 "Question?" [OPTION..]
 ```
 
-- `--text` adds a free-text box. `Reply` is the submit button. For choices,
-  list them as buttons instead, e.g. `"Push to GitHub" "Add tests" "That's all"`.
-  Keep each label to a few words.
+- Always pass `--text`. It adds a text box, plus a button for sending typed
+  text as its own instruction: "Do this instead" when there are options,
+  "Send" when there are none. Options are buttons, e.g.
+  `"Push to GitHub" "Add tests" "That's all"`. Keep each label to a few words.
+  With no options, the ask is a plain open question.
 - Run it with the Bash tool's `run_in_background: true`. A foreground call
   would be killed after 10 minutes, and you're re-invoked when it exits.
 - On exit 0, stdout is JSON: `option` is the button tapped and `text` is what
-  they typed (may be empty). Treat it as the user's instruction, the same as a
+  they typed. `option` is `"message"` when they sent their own instruction
+  instead of picking one; follow `text` then. Otherwise `text` is an optional
+  note on their choice. Treat either as the user's instruction, the same as a
   terminal message.
+- Exit 4 means the notification couldn't be sent, so nobody will answer. Tell
+  the user in the terminal.
 - Exit 3 means it expired unanswered. Send at most one follow-up, then stop
   and wait for the terminal.
 - `-e` is the expiry in seconds. Use longer (e.g. `14400`) if the user said
@@ -98,6 +104,7 @@ Add `-l timeSensitive` only when it needs attention right now.
 - Short messages, question first, context after. Lock screens truncate, but
   the reply page shows the full text.
 - One outstanding `ask` at a time.
+- `message` is reserved and can't be an option.
 - Never use an option name that matches a key in `~/.config/dawg/actions.toml`
   (`ping`, `uptime`, `disk`, `memory`, ...): tapping it runs that command.
 - Never send secrets, tokens, or large code dumps. Notifications pass through
