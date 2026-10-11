@@ -5,6 +5,10 @@ Subcommands:
   dawgd.py serve                     run the reply server (Tailscale-only)
   dawgd.py ask [opts] MESSAGE OPT..  send a request with reply options
   dawgd.py ask [opts] --questions F  send several questions behind one link
+  dawgd.py send -T ID [opts] MESSAGE post to a thread, and text it unless muted
+  dawgd.py status -T ID STATUS [NOTE] set a thread's status: busy, blocked, idle
+  dawgd.py inbox -T ID [-w]          print messages queued for a thread
+  dawgd.py thread new -t TITLE       start a thread; prints its id
 
 A request is a notification whose tap opens a page with one button per
 option. A request with several questions shows them one at a time, then
@@ -12,17 +16,26 @@ a review step, and returns all the answers together. Options whose name
 matches an action in actions.toml run that action's fixed command when
 chosen; other options are just recorded so a waiting script can read them.
 
+A thread is one agent's conversation. The inbox page (/m/<token>) lists
+every thread with its status, shows its messages and asks, answers asks
+inline, queues messages for the agent, mutes a thread's texts, and starts
+new agents in herdr.
+
 Files:
   ~/.config/dawg/actions.toml   documented action keys -> fixed commands
   ~/.config/dawg/dawgd.toml     server settings (bind, port, base_url)
   ~/.config/dawg/token          secret for the standing-actions page
   ~/.local/state/dawg/          pending requests and answers
+  ~/.local/state/dawg/threads/  thread metadata and message logs
 """
 
 import argparse
+import contextlib
+import fcntl
 import html
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -32,14 +45,22 @@ import time
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 CONFIG_DIR = Path.home() / ".config" / "dawg"
 STATE_DIR = Path.home() / ".local" / "state" / "dawg"
 ACTIONS_FILE = CONFIG_DIR / "actions.toml"
 SETTINGS_FILE = CONFIG_DIR / "dawgd.toml"
 TOKEN_FILE = CONFIG_DIR / "token"
+THREADS_DIR = STATE_DIR / "threads"
+INBOX_PAGE = Path(__file__).with_name("inbox.html")
 DAWG = shutil.which("dawg") or str(Path(__file__).with_name("dawg"))
+HERDR = shutil.which("herdr")
+
+STATUSES = ("busy", "blocked", "idle")
+# Agents the inbox can start in herdr, and the keys it can press for them.
+AGENT_KINDS = ("claude", "codex")
+HERDR_KEYS = ("enter", "esc", "up", "down", "tab", "ctrl+c", "1", "2", "3", "y", "n")
 
 # Option recorded when the user sends their own message instead of a listed option.
 MESSAGE = "message"
@@ -50,6 +71,8 @@ DEFAULT_SETTINGS = {
     "base_url": None,  # set in dawgd.toml; install.sh fills it in
     "max_output": 1500,
     "keep_days": 7,
+    "thread_keep_days": 30,
+    "herdr_session": None,  # run herdr against a named session instead of the default
 }
 
 answer_lock = threading.Lock()
@@ -82,12 +105,15 @@ def get_token():
     return TOKEN_FILE.read_text().strip()
 
 
-def notify(title, body, url=None, group="dawgd"):
+def notify(title, body, url=None, group="dawgd", level=None, sound=None):
     cmd = [DAWG, "-t", title, "-g", group]
-    if url:
-        cmd += ["-u", url]
+    for flag, value in (("-u", url), ("-l", level), ("-s", sound)):
+        if value:
+            cmd += [flag, value]
+    # Without DAWG_THREAD, so dawg sends the text instead of posting to the thread again.
+    env = {k: v for k, v in os.environ.items() if k != "DAWG_THREAD"}
     try:
-        return subprocess.run(cmd + [body], check=False, timeout=20).returncode == 0
+        return subprocess.run(cmd + ["--", body], check=False, timeout=20, env=env).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -165,12 +191,265 @@ def write_json(path, data):
     tmp.replace(path)
 
 
-def purge_old(keep_days):
+def purge_old(keep_days, thread_keep_days):
     cutoff = time.time() - keep_days * 86400
     for p in STATE_DIR.glob("*.json"):
         if p.stat().st_mtime < cutoff:
             p.unlink(missing_ok=True)
+    cutoff = time.time() - thread_keep_days * 86400
+    for p in THREADS_DIR.glob("*.json"):
+        if p.stat().st_mtime < cutoff:
+            for suffix in (".json", ".log.jsonl", ".lock"):
+                p.with_name(p.stem + suffix).unlink(missing_ok=True)
 
+
+def ask_open(rid):
+    req = load_request(rid)
+    return bool(req) and not ans_path(rid).exists() and time.time() < req["expires"]
+
+
+def record_answers(rid, req, answers):
+    """Save a request's answers. The caller holds answer_lock and checked it's open."""
+    ans = {"answers": answers, "answered_at": time.time()}
+    write_json(ans_path(rid), ans)
+    draft_path(rid).unlink(missing_ok=True)
+    tid = req.get("thread")
+    if tid and load_thread(tid):
+        def answered(meta):
+            meta["open_asks"] = [r for r in meta["open_asks"] if r != rid]
+            meta["status"] = "busy"  # the agent has its answer and is back at work
+        post(tid, {"kind": "answer", "from": "user", "rid": rid, "answers": answers}, answered)
+    return ans
+
+
+def run_answer_actions(rid, req, ans, max_output):
+    actions = load_actions()
+    for a in ans["answers"]:
+        option = a["option"]
+        if option != MESSAGE and option in actions:
+            a["result"] = run_action(option, actions[option], max_output)
+            write_json(ans_path(rid), ans)
+            r = a["result"]
+            if req.get("thread") and load_thread(req["thread"]):
+                post(req["thread"], {"kind": "result", "from": "system", "rid": rid, "result": r})
+            notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"])
+
+
+def check_answers(req, answers):
+    """Validate inbox answers [{option, text}] against req; return them or an error string."""
+    qs = req["questions"]
+    if not isinstance(answers, list) or len(answers) != len(qs):
+        return "Answer every question."
+    out = []
+    for q, a in zip(qs, answers):
+        option = str(a.get("option") or "")
+        text = str(a.get("text") or "").strip() if req.get("allow_text") else ""
+        if option == MESSAGE and req.get("allow_text"):
+            if not text:
+                return "Write a message first."
+        elif option not in q["options"]:
+            return "Pick an option for every question."
+        out.append({"question": q["message"], "option": option, "text": text, "result": None})
+    return out
+
+
+# ---------------------------------------------------------------- threads
+#
+# A thread is one agent session's conversation: a metadata file and an
+# append-only log, written by both dawgd and the CLI, so every change takes
+# the thread's file lock. Log entries carry a sequence number; messages the
+# user queues are delivered when the agent runs `dawg inbox`.
+
+def thread_path(tid):
+    return THREADS_DIR / f"{tid}.json"
+
+
+def log_path(tid):
+    return THREADS_DIR / f"{tid}.log.jsonl"
+
+
+def valid_thread(tid):
+    return bool(tid) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", tid) is not None
+
+
+@contextlib.contextmanager
+def thread_lock(tid):
+    THREADS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(THREADS_DIR / f"{tid}.lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+def load_thread(tid):
+    if not valid_thread(tid) or not thread_path(tid).exists():
+        return None
+    return json.loads(thread_path(tid).read_text())
+
+
+def new_thread(title, cwd=None, tid=None, herdr=None):
+    tid = tid or secrets.token_hex(6)
+    now = time.time()
+    meta = {"id": tid, "title": title, "cwd": cwd, "created": now, "updated": now,
+            "status": "idle", "status_note": "", "muted": False, "archived": False,
+            "seq": 0, "delivered": 0, "unread": 0, "preview": "", "open_asks": [],
+            "herdr": herdr}
+    with thread_lock(tid):
+        if not thread_path(tid).exists():
+            write_json(thread_path(tid), meta)
+    return load_thread(tid)
+
+
+def update_thread(tid, change):
+    """Apply change(meta) to the thread's metadata under its lock."""
+    with thread_lock(tid):
+        meta = json.loads(thread_path(tid).read_text())
+        change(meta)
+        write_json(thread_path(tid), meta)
+    return meta
+
+
+def preview(entry):
+    kind = entry["kind"]
+    if kind == "text":
+        text = entry["body"]
+    elif kind == "ask":
+        text = entry["questions"][0]["message"]
+    elif kind == "answer":
+        a = entry["answers"][0]
+        text = a["text"] if a["option"] == MESSAGE else a["option"]
+    else:
+        text = entry.get("body", "")
+    who = "You: " if entry["from"] == "user" else ""
+    return (who + " ".join(text.split()))[:140]
+
+
+def post(tid, entry, change=None):
+    """Append entry to the thread's log, applying change(meta) in the same step."""
+    with thread_lock(tid):
+        meta = json.loads(thread_path(tid).read_text())
+        meta["seq"] += 1
+        entry = {"seq": meta["seq"], "ts": time.time(), **entry}
+        meta["updated"] = entry["ts"]
+        if entry["kind"] not in ("result", "status"):  # the list shows the status already
+            meta["preview"] = preview(entry)
+        if entry["from"] == "agent":
+            meta["archived"] = False
+            if entry["kind"] in ("text", "ask"):
+                meta["unread"] += 1
+        if change:
+            change(meta)
+        with open(log_path(tid), "a") as f:
+            f.write(json.dumps(entry) + "\n")
+        write_json(thread_path(tid), meta)
+    return entry
+
+
+def read_log(tid, after=0):
+    if not log_path(tid).exists():
+        return []
+    entries = (json.loads(line) for line in log_path(tid).read_text().splitlines() if line)
+    return [x for x in entries if x["seq"] > after]
+
+
+def thread_status(meta):
+    if any(ask_open(rid) for rid in meta["open_asks"]):
+        return "blocked"
+    return meta["status"]
+
+
+def take_queued(tid):
+    """Return the user's messages the agent hasn't seen, and mark them delivered."""
+    with thread_lock(tid):
+        meta = json.loads(thread_path(tid).read_text())
+        msgs = [x for x in read_log(tid, meta["delivered"])
+                if x["from"] == "user" and x["kind"] == "text"]
+        meta["delivered"] = meta["seq"]
+        write_json(thread_path(tid), meta)
+    return msgs
+
+
+def queued_count(tid):
+    meta = load_thread(tid)
+    return sum(1 for x in read_log(tid, meta["delivered"])
+               if x["from"] == "user" and x["kind"] == "text")
+
+
+
+# ---------------------------------------------------------------- herdr
+
+class HerdrError(Exception):
+    pass
+
+
+herdr_cache = {"at": 0.0, "agents": {}}
+herdr_cache_lock = threading.Lock()
+
+
+def herdr(settings, *args, timeout=30):
+    """Run a herdr command and return its parsed JSON, or plain text output."""
+    if not HERDR:
+        raise HerdrError("herdr is not installed")
+    session = ["--session", settings["herdr_session"]] if settings["herdr_session"] else []
+    try:
+        p = subprocess.run([HERDR, *session, *args], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise HerdrError(f"herdr {args[0]} {args[1]} timed out")
+    if p.returncode != 0:
+        try:
+            msg = json.loads(p.stderr or p.stdout)["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            msg = (p.stderr or p.stdout).strip() or f"exit {p.returncode}"
+        raise HerdrError(msg)
+    try:
+        return json.loads(p.stdout)
+    except ValueError:
+        return p.stdout
+
+
+def herdr_agents(settings):
+    """Live herdr agents by name, refreshed at most every few seconds."""
+    with herdr_cache_lock:
+        if time.time() - herdr_cache["at"] > 3:
+            try:
+                out = herdr(settings, "agent", "list", timeout=5)
+                herdr_cache["agents"] = {a["name"]: a for a in out["result"]["agents"] if a.get("name")}
+            except (HerdrError, KeyError, TypeError):
+                herdr_cache["agents"] = {}
+            herdr_cache["at"] = time.time()
+        return herdr_cache["agents"]
+
+
+def agent_prompt(kind, tid, task):
+    intro = (f"You were started from the dawg inbox. Your dawg thread is {tid} "
+             f"(DAWG_THREAD is set). Go straight into away mode.")
+    if kind == "claude":
+        return f"/dawg {intro}\n\nTask: {task}"
+    return f"Use the dawg skill. {intro}\n\nTask: {task}"
+
+
+def start_agent(settings, tid, cwd, kind, task):
+    """Open a herdr workspace for the thread and start the agent in it."""
+    meta = load_thread(tid)
+    name = meta["herdr"]["agent"]
+
+    def note(body):
+        post(tid, {"kind": "system", "from": "system", "body": body})
+
+    try:
+        out = herdr(settings, "workspace", "create", "--cwd", cwd, "--label", meta["title"],
+                    "--env", f"DAWG_THREAD={tid}", "--no-focus")["result"]
+        wid, pane = out["workspace"]["workspace_id"], out["root_pane"]["pane_id"]
+
+        def placed(m):
+            m["herdr"].update(workspace=wid, pane=pane)
+        update_thread(tid, placed)
+        herdr(settings, "agent", "start", name, "--kind", kind, "--pane", pane,
+              "--timeout", "120000", timeout=150)
+        herdr(settings, "agent", "prompt", name, agent_prompt(kind, tid, task))
+        note(f"Started {kind} as {name} in herdr workspace {wid}.")
+    except (HerdrError, KeyError, TypeError) as err:
+        note(f"Couldn't start the agent: {err}")
+        update_thread(tid, lambda m: m.update(status="idle"))
 
 # ---------------------------------------------------------------- web
 
@@ -246,31 +525,210 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in form.items()}
 
     def route(self):
-        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        parts = [p for p in urlsplit(self.path).path.split("/") if p]
         if len(parts) == 2 and parts[0] == "r":
             return "request", parts[1]
-        if len(parts) == 2 and parts[0] == "a" and secrets.compare_digest(parts[1], self.server.token):
+        authed = len(parts) >= 2 and secrets.compare_digest(parts[1], self.server.token)
+        if len(parts) == 2 and parts[0] == "a" and authed:
             return "standing", None
+        if parts[:1] == ["m"] and authed:
+            if len(parts) == 2:
+                return "inbox", None
+            if len(parts) == 4 and parts[2] == "api":
+                return "api", parts[3]
         return None, None
 
     def do_GET(self):
-        kind, rid = self.route()
+        kind, arg = self.route()
         if kind == "request":
-            self.show_request(rid)
+            self.show_request(arg)
         elif kind == "standing":
             self.show_standing()
+        elif kind == "inbox":
+            self.send_file(INBOX_PAGE, "text/html; charset=utf-8")
+        elif kind == "api" and arg == "state":
+            self.api_state(parse_qs(urlsplit(self.path).query))
         else:
             self.not_found()
 
     def do_POST(self):
-        kind, rid = self.route()
+        kind, arg = self.route()
+        if kind == "api":
+            return self.api_post(arg)
         form = self.read_form()
         if kind == "request":
-            self.answer_request(rid, form)
+            self.answer_request(arg, form)
         elif kind == "standing":
             self.run_standing(form)
         else:
             self.not_found()
+
+    def send_file(self, path, ctype):
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_json(self, data, code=200):
+        body = json.dumps(data).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- inbox (bookmarkable): every thread, its messages, and controls
+
+    def api_state(self, query):
+        settings = self.server.settings
+        agents = herdr_agents(settings)
+        threads = []
+        for p in sorted(THREADS_DIR.glob("*.json")):
+            meta = json.loads(p.read_text())
+            meta["state"] = thread_status(meta)
+            h = meta.get("herdr")
+            if h:
+                live = agents.get(h["agent"])
+                h["live"] = live["agent_status"] if live else None
+                # herdr sees the agent sitting at its prompt even when its last status was busy.
+                if meta["state"] == "busy" and h["live"] in ("idle", "done"):
+                    meta["state"] = "idle"
+            threads.append(meta)
+        threads.sort(key=lambda m: m["updated"], reverse=True)
+        out = {"threads": threads, "now": time.time(), "kinds": list(AGENT_KINDS),
+               "keys": list(HERDR_KEYS), "herdr": bool(HERDR)}
+        tid = query.get("thread", [""])[0]
+        if load_thread(tid):
+            actions = load_actions()
+            entries = read_log(tid)[-500:]
+            for x in entries:
+                if x["kind"] == "ask":
+                    rid = x["rid"]
+                    x["open"] = ask_open(rid)
+                    ans = load_answer(rid)
+                    x["answers"] = ans["answers"] if ans else None
+                    x["runs"] = {o: actions[o].get("description") or " ".join(actions[o]["command"])
+                                 for q in x["questions"] for o in q["options"] if o in actions}
+            out["entries"] = entries
+        self.send_json(out)
+
+    def read_json(self):
+        n = min(int(self.headers.get("Content-Length") or 0), 65536)
+        try:
+            data = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def api_post(self, name):
+        data = self.read_json()
+        settings = self.server.settings
+        if name == "start":
+            return self.api_start(data)
+        tid = str(data.get("thread", ""))
+        meta = load_thread(tid)
+        if not meta:
+            return self.send_json({"error": "No such thread."}, 404)
+        if name == "send":
+            text = str(data.get("text", "")).strip()
+            if not text:
+                return self.send_json({"error": "Write a message first."}, 400)
+            # An agent waiting on a single open question gets the message as its answer.
+            for rid in reversed(meta["open_asks"]):
+                req = load_request(rid)
+                if req and len(req["questions"]) == 1 and req.get("allow_text"):
+                    with answer_lock:
+                        if ask_open(rid):
+                            q = req["questions"][0]["message"]
+                            record_answers(rid, req, [{"question": q, "option": MESSAGE,
+                                                       "text": text, "result": None}])
+                            return self.send_json({"answered": rid})
+            post(tid, {"kind": "text", "from": "user", "body": text})
+            return self.send_json({"queued": True})
+        if name == "answer":
+            rid = str(data.get("rid", ""))
+            req = load_request(rid)
+            if not req or req.get("thread") != tid:
+                return self.send_json({"error": "No such question."}, 404)
+            answers = check_answers(req, data.get("answers"))
+            if isinstance(answers, str):
+                return self.send_json({"error": answers}, 400)
+            with answer_lock:
+                if not ask_open(rid):
+                    return self.send_json({"error": "Already answered or expired."}, 409)
+                ans = record_answers(rid, req, answers)
+            run_answer_actions(rid, req, ans, settings["max_output"])
+            return self.send_json({"answered": rid})
+        if name == "thread":
+            def change(m):
+                for key in ("muted", "archived"):
+                    if key in data:
+                        m[key] = bool(data[key])
+                if data.get("read"):
+                    m["unread"] = 0
+            update_thread(tid, change)
+            return self.send_json({"ok": True})
+        if name == "herdr":
+            return self.api_herdr(meta, data)
+        self.send_json({"error": "Unknown call."}, 404)
+
+    def api_start(self, data):
+        cwd = Path(str(data.get("cwd", "")).strip() or "~").expanduser()
+        kind = data.get("kind", "claude")
+        task = str(data.get("task", "")).strip()
+        if not HERDR:
+            return self.send_json({"error": "herdr is not installed."}, 400)
+        if not cwd.is_dir():
+            return self.send_json({"error": f"No such directory: {cwd}"}, 400)
+        if kind not in AGENT_KINDS:
+            return self.send_json({"error": "Unknown agent kind."}, 400)
+        if not task:
+            return self.send_json({"error": "Say what the agent should do."}, 400)
+        title = str(data.get("title", "")).strip()[:60] or cwd.name or str(cwd)
+        tid = secrets.token_hex(6)
+        new_thread(title, cwd=str(cwd), tid=tid, herdr={"agent": f"dawg-{tid}", "kind": kind})
+        post(tid, {"kind": "text", "from": "user", "body": task}, lambda m: m.update(
+            status="busy", delivered=m["seq"]))
+        threading.Thread(target=start_agent, args=(self.server.settings, tid, str(cwd), kind, task),
+                         daemon=True).start()
+        self.send_json({"thread": tid})
+
+    def api_herdr(self, meta, data):
+        settings, h, op = self.server.settings, meta.get("herdr"), data.get("op")
+        if not h:
+            return self.send_json({"error": "This agent isn't running in herdr."}, 400)
+        try:
+            if op == "read":
+                out = herdr(settings, "agent", "read", h["agent"], "--source", "recent-unwrapped",
+                            "--lines", "80", timeout=10)
+                return self.send_json({"output": out if isinstance(out, str) else json.dumps(out)})
+            if op == "keys":
+                key = data.get("key")
+                if key not in HERDR_KEYS:
+                    return self.send_json({"error": "That key isn't allowed."}, 400)
+                herdr(settings, "agent", "send-keys", h["agent"], key, timeout=10)
+                return self.send_json({"ok": True})
+            if op == "prompt":
+                text = str(data.get("text", "")).strip()
+                if not text:
+                    return self.send_json({"error": "Write a prompt first."}, 400)
+                herdr(settings, "agent", "prompt", h["agent"], text, timeout=15)
+                post(meta["id"], {"kind": "system", "from": "system",
+                                  "body": f"Typed into the terminal: {text}"})
+                return self.send_json({"ok": True})
+            if op == "close":
+                herdr(settings, "workspace", "close", h["workspace"], timeout=15)
+                post(meta["id"], {"kind": "system", "from": "system",
+                                  "body": "Closed the herdr workspace."},
+                     lambda m: m.update(status="idle"))
+                return self.send_json({"ok": True})
+        except (HerdrError, KeyError) as err:
+            return self.send_json({"error": str(err)}, 502)
+        self.send_json({"error": "Unknown herdr call."}, 400)
 
     # -- one-off requests
 
@@ -354,17 +812,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.show_request(rid)
             elif draft["pos"] != len(qs):
                 return self.show_request(rid, '<div class="card bad">That page was out of date.</div>')
-            ans = {"answers": draft["answers"], "answered_at": time.time()}
-            write_json(ans_path(rid), ans)
-            draft_path(rid).unlink(missing_ok=True)
-        actions = load_actions()
-        for a in ans["answers"]:
-            option = a["option"]
-            if option != MESSAGE and option in actions:
-                a["result"] = run_action(option, actions[option], self.server.settings["max_output"])
-                write_json(ans_path(rid), ans)
-                r = a["result"]
-                notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"])
+            ans = record_answers(rid, req, draft["answers"])
+        run_answer_actions(rid, req, ans, self.server.settings["max_output"])
         self.show_request(rid)
 
     # -- standing actions (bookmarkable)
@@ -390,11 +839,14 @@ def serve(_args):
     settings = load_settings()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     load_actions()  # fail fast on a bad config
-    purge_old(settings["keep_days"])
+    THREADS_DIR.mkdir(parents=True, exist_ok=True)
+    purge_old(settings["keep_days"], settings["thread_keep_days"])
     srv = ThreadingHTTPServer((settings["bind"], settings["port"]), Handler)
     srv.settings = settings
     srv.token = get_token()
     print(f"dawgd listening on {settings['bind']}:{settings['port']}", file=sys.stderr, flush=True)
+    if settings["base_url"]:
+        print(f"inbox: {settings['base_url']}/m/<token>  (token in {TOKEN_FILE})", file=sys.stderr, flush=True)
     srv.serve_forever()
 
 
@@ -435,10 +887,13 @@ def ask(args):
             sys.exit("dawg ask: duplicate options")
         if MESSAGE in q["options"]:
             sys.exit(f"dawg ask: {MESSAGE!r} is reserved for free-text replies")
+    meta = thread_for(args)
     rid = secrets.token_hex(16)
     now = time.time()
     req = {"id": rid, "title": args.title, "questions": qs,
            "allow_text": args.text, "created": now, "expires": now + args.expires}
+    if meta:
+        req["thread"] = meta["id"]
     write_json(req_path(rid), req)
     first = qs[0]
     if len(qs) > 1:
@@ -448,10 +903,17 @@ def ask(args):
     runs = sorted({o for q in qs for o in q["options"] if o in actions})
     if runs:
         body += f"  (runs: {', '.join(runs)})"
-    if not notify(args.title, body, url=f"{settings['base_url']}/r/{rid}", group=args.group):
+    if meta and meta["muted"]:
+        print("dawg ask: texts are muted for this thread; the question is in the inbox",
+              file=sys.stderr)
+    elif not notify(args.title, body, url=f"{settings['base_url']}/r/{rid}", group=args.group):
         req_path(rid).unlink(missing_ok=True)
         print("dawg ask: notification not sent; nothing to wait for", file=sys.stderr)
         return 4
+    if meta:
+        post(meta["id"], {"kind": "ask", "from": "agent", "rid": rid, "questions": qs,
+                          "allow_text": args.text, "expires": req["expires"]},
+             lambda m: m["open_asks"].append(rid))
     if not args.wait:
         print(rid)
         return 0
@@ -484,13 +946,112 @@ def ask(args):
     return 3
 
 
+# ---------------------------------------------------------------- thread commands
+
+def thread_for(args, required=False):
+    """The thread named by -T or DAWG_THREAD, created on first use; None if neither."""
+    tid = args.thread
+    if not tid:
+        if required:
+            sys.exit(f"dawg {args.cmd}: give a thread with -T, or set DAWG_THREAD")
+        return None
+    if not valid_thread(tid):
+        sys.exit(f"dawg {args.cmd}: bad thread id {tid!r}")
+    return load_thread(tid) or new_thread(args.title, cwd=os.getcwd(), tid=tid)
+
+
+def queued_hint(tid):
+    if n := queued_count(tid):
+        print(f"dawg: {n} message{'s' if n > 1 else ''} queued for you; run: dawg inbox -T {tid}",
+              file=sys.stderr)
+
+
+def send_cmd(args):
+    meta = thread_for(args, required=True)
+    post(meta["id"], {"kind": "text", "from": "agent", "body": args.message})
+    if not meta["muted"]:
+        if not notify(args.title, args.message, url=args.url, group=args.group,
+                      level=args.level, sound=args.sound):
+            print("dawg: posted to the inbox, but the text wasn't sent", file=sys.stderr)
+            return 1
+    queued_hint(meta["id"])
+    return 0
+
+
+def status_cmd(args):
+    meta = thread_for(args, required=True)
+    note = " ".join(args.note)
+    if (meta["status"], meta["status_note"]) != (args.status, note):
+        post(meta["id"], {"kind": "status", "from": "agent", "status": args.status, "note": note},
+             lambda m: m.update(status=args.status, status_note=note))
+    queued_hint(meta["id"])
+    return 0
+
+
+def inbox_cmd(args):
+    meta = thread_for(args, required=True)
+    deadline = time.time() + args.expires
+    while True:
+        msgs = take_queued(meta["id"])
+        if msgs or not args.wait:
+            break
+        if time.time() > deadline:
+            print("dawg inbox: nothing arrived before the wait expired", file=sys.stderr)
+            return 3
+        time.sleep(1)
+    if args.json:
+        print(json.dumps({"messages": [{"text": m["body"], "sent_at": m["ts"]} for m in msgs]}))
+    else:
+        print("\n\n".join(m["body"] for m in msgs))
+    return 0
+
+
+def thread_cmd(args):
+    if args.action == "new":
+        print(new_thread(args.title, cwd=os.getcwd())["id"])
+    else:
+        for p in sorted(THREADS_DIR.glob("*.json")):
+            m = json.loads(p.read_text())
+            print(f"{m['id']}  {thread_status(m):7}  {m['title']}  {m.get('cwd') or ''}")
+    return 0
+
+
 def main():
+    env_thread = os.environ.get("DAWG_THREAD")
     p = argparse.ArgumentParser(prog="dawgd")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve").set_defaults(func=serve)
-    a = sub.add_parser("ask", prog="dawg ask",
-                       description="Send a notification with reply options.")
-    a.add_argument("-t", "--title", default=os.uname().nodename)
+
+    def threaded(name, **kw):
+        c = sub.add_parser(name, prog=f"dawg {name}", **kw)
+        c.add_argument("-T", "--thread", default=env_thread,
+                       help="inbox thread id (default: $DAWG_THREAD)")
+        c.add_argument("-t", "--title", default=os.uname().nodename,
+                       help="title; also names a thread it creates")
+        return c
+
+    s = threaded("send", description="Post a message to a thread and text it unless muted.")
+    s.add_argument("-g", "--group", default="dawgd")
+    s.add_argument("-l", "--level")
+    s.add_argument("-s", "--sound")
+    s.add_argument("-u", "--url")
+    s.add_argument("message")
+    s.set_defaults(func=send_cmd)
+    s = threaded("status", description="Set a thread's status, shown in the inbox.")
+    s.add_argument("status", choices=STATUSES)
+    s.add_argument("note", nargs="*", help="short note shown with the status")
+    s.set_defaults(func=status_cmd)
+    s = threaded("inbox", description="Print messages the user queued for this thread.")
+    s.add_argument("-w", "--wait", action="store_true", help="block until a message arrives")
+    s.add_argument("-e", "--expires", type=int, default=3600, help="with -w, seconds (default 3600)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=inbox_cmd)
+    s = sub.add_parser("thread", prog="dawg thread", description="Start or list inbox threads.")
+    s.add_argument("action", choices=("new", "list"))
+    s.add_argument("-t", "--title", default=os.uname().nodename)
+    s.set_defaults(func=thread_cmd)
+
+    a = threaded("ask", description="Send a notification with reply options.")
     a.add_argument("-g", "--group", default="dawgd")
     a.add_argument("-e", "--expires", type=int, default=3600, help="seconds (default 3600)")
     a.add_argument("-w", "--wait", action="store_true", help="block until answered; print the option")

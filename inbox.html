@@ -1,0 +1,414 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>dawg inbox</title>
+<style>
+:root{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--muted:#6e6e73;--line:#e3e3e8;--accent:#0a66d8;--accent-fg:#fff;
+--bubble:#e9e9ee;--ok:#1a7f37;--bad:#c62828;--busy:#0a66d8;--blocked:#d97706;--idle:#8e8e93}
+@media (prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--fg:#f5f5f7;--muted:#98989d;--line:#2c2c2e;
+--accent:#3d8bfd;--bubble:#2c2c2e;--ok:#3fb950;--bad:#f85149;--busy:#3d8bfd;--blocked:#f0a020;--idle:#7c7c80}}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 -apple-system,system-ui,sans-serif}
+button{font:inherit;cursor:pointer;border:0;border-radius:9px;padding:8px 12px;background:var(--bubble);color:var(--fg)}
+button.primary{background:var(--accent);color:var(--accent-fg);font-weight:600}
+button:disabled{opacity:.5;cursor:default}
+textarea,input,select{font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:9px;padding:8px 10px;width:100%}
+.app{display:flex;height:100%;height:100dvh}
+.side{width:320px;flex:none;border-right:1px solid var(--line);background:var(--card);display:flex;flex-direction:column}
+.side header{display:flex;align-items:center;gap:8px;padding:12px 14px;border-bottom:1px solid var(--line)}
+.side header h1{font-size:18px;margin:0;flex:1}
+.list{overflow-y:auto;flex:1}
+.item{display:flex;gap:10px;padding:11px 14px;border-bottom:1px solid var(--line);cursor:pointer}
+.item:hover{background:var(--bg)} .item.sel{background:var(--bubble)}
+.item .body{flex:1;min-width:0}
+.item .top{display:flex;gap:6px;align-items:baseline}
+.item .title{font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.item .when{color:var(--muted);font-size:12px;flex:none}
+.item .prev{color:var(--muted);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{background:var(--accent);color:var(--accent-fg);border-radius:10px;font-size:12px;padding:0 7px;font-weight:600}
+.dot{width:10px;height:10px;border-radius:50%;flex:none;margin-top:5px;background:var(--idle)}
+.dot.busy{background:var(--busy);animation:pulse 1.6s infinite} .dot.blocked{background:var(--blocked)}
+@keyframes pulse{50%{opacity:.35}}
+.foot{padding:10px 14px;border-top:1px solid var(--line);font-size:13px;color:var(--muted);display:flex;gap:12px}
+.foot a{color:var(--muted)}
+.main{flex:1;display:flex;flex-direction:column;min-width:0}
+.thead{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:wrap}
+.thead .name{flex:1;min-width:140px} .thead .name b{display:block;font-size:16px}
+.thead .name small{color:var(--muted)}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;padding:2px 9px;border-radius:12px;background:var(--bubble)}
+.pill .dot{margin:0;width:8px;height:8px}
+.msgs{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:8px}
+.msg{max-width:min(620px,85%);padding:9px 12px;border-radius:16px;white-space:pre-wrap;word-wrap:break-word}
+.msg.agent{align-self:flex-start;background:var(--card);border:1px solid var(--line);border-bottom-left-radius:5px}
+.msg.user{align-self:flex-end;background:var(--accent);color:var(--accent-fg);border-bottom-right-radius:5px}
+.meta{font-size:11px;color:var(--muted);margin-top:2px}
+.msg.user .meta{color:rgba(255,255,255,.75);text-align:right}
+.sys{align-self:center;color:var(--muted);font-size:12px;text-align:center;max-width:90%}
+.ask .q{margin:0 0 6px} .ask .q+.q{border-top:1px solid var(--line);padding-top:8px;margin-top:8px}
+.opts{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.opts button{border:1px solid var(--accent);background:transparent;color:var(--accent)}
+.opts button.on{background:var(--accent);color:var(--accent-fg)}
+.opts small{display:block;font-size:11px;opacity:.8}
+.ask textarea{margin-top:4px;resize:vertical}
+.ask .row{display:flex;gap:6px;margin-top:8px;justify-content:flex-end}
+.ask .state{font-size:12px;color:var(--muted);margin-top:6px}
+.answer b{font-weight:600}
+pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:8px;border-radius:8px;font-size:12px;margin:6px 0 0}
+.ok{color:var(--ok)} .bad{color:var(--bad)}
+.compose{display:flex;gap:8px;padding:10px 14px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--card);align-items:flex-end}
+.compose textarea{min-height:40px;max-height:160px;resize:none}
+.hint{font-size:12px;color:var(--muted);padding:0 14px 6px;background:var(--card)}
+.empty{margin:auto;color:var(--muted);text-align:center;padding:20px}
+.err{color:var(--bad);font-size:13px}
+dialog{border:0;border-radius:14px;background:var(--card);color:var(--fg);width:min(560px,94vw);padding:16px}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog h2{margin:0 0 10px;font-size:18px}
+dialog label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px}
+dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap}
+#termOut{max-height:55vh;overflow:auto;font:12px/1.3 ui-monospace,Menlo,monospace;margin:0}
+.keys{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+.keys button{font:12px ui-monospace,Menlo,monospace;padding:6px 9px}
+.back{display:none}
+@media (max-width:720px){
+  .side{width:100%;border-right:0} .main{display:none}
+  .app.open .side{display:none} .app.open .main{display:flex}
+  .back{display:inline-block}
+}
+</style>
+</head>
+<body>
+<div class="app" id="app">
+  <aside class="side">
+    <header><h1>dawg</h1><button class="primary" id="newBtn">New agent</button></header>
+    <div class="list" id="list"></div>
+    <div class="foot"><label><input type="checkbox" id="showArch" style="width:auto"> Archived</label>
+      <a id="actionsLink" href="#">Actions</a><span id="conn"></span></div>
+  </aside>
+  <main class="main" id="main"><div class="empty">Pick a thread.</div></main>
+</div>
+
+<dialog id="newDlg">
+  <form method="dialog" id="newForm">
+    <h2>New agent</h2>
+    <p class="meta" id="herdrNote">Starts the agent in a new herdr workspace, with its own thread here.</p>
+    <label for="nCwd">Directory</label>
+    <input id="nCwd" list="cwds" placeholder="~/project" required>
+    <datalist id="cwds"></datalist>
+    <label for="nKind">Agent</label>
+    <select id="nKind"></select>
+    <label for="nTitle">Thread title (optional)</label>
+    <input id="nTitle" placeholder="defaults to the directory name">
+    <label for="nTask">Task</label>
+    <textarea id="nTask" rows="4" required placeholder="What should it work on?"></textarea>
+    <div class="err" id="nErr"></div>
+    <div class="row"><button value="cancel" formnovalidate>Cancel</button><button class="primary" id="nGo" value="go">Start</button></div>
+  </form>
+</dialog>
+
+<dialog id="termDlg">
+  <h2>Terminal <small class="meta" id="termState"></small></h2>
+  <pre id="termOut"></pre>
+  <div class="keys" id="termKeys"></div>
+  <label for="termText" class="meta">Type into the agent's prompt (bypasses the inbox queue)</label>
+  <div style="display:flex;gap:6px"><input id="termText"><button id="termSend">Send</button></div>
+  <div class="err" id="termErr"></div>
+  <div class="row"><button id="termRefresh">Refresh</button><button id="termClose" class="primary">Done</button></div>
+</dialog>
+
+<script>
+"use strict";
+const BASE = location.pathname.replace(/\/+$/, "");
+const $ = s => document.querySelector(s);
+const el = (tag, attrs = {}, ...kids) => {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else if (v !== false && v != null) n.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k != null && k !== false) n.append(k.nodeType ? k : String(k));
+  return n;
+};
+
+let state = {threads: [], entries: [], now: Date.now() / 1000};
+let sel = new URLSearchParams(location.hash.slice(1)).get("t") || "";
+let renderedThread = "", renderedSeq = {}, lastSeq = 0;
+let polling = null;
+
+async function api(name, body) {
+  const r = await fetch(`${BASE}/api/${name}`, {method: "POST", headers: {"Content-Type": "application/json"},
+                                                  body: JSON.stringify(body)});
+  const data = await r.json().catch(() => ({error: `HTTP ${r.status}`}));
+  if (!r.ok || data.error) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
+}
+
+function ago(ts) {
+  const s = Math.max(0, state.now - ts);
+  if (s < 60) return "now";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  return new Date(ts * 1000).toLocaleDateString(undefined, {month: "short", day: "numeric"});
+}
+const clock = ts => new Date(ts * 1000).toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"});
+const statusText = t => t.state + (t.state === t.status && t.status_note ? ` · ${t.status_note}` : "");
+
+async function refresh() {
+  try {
+    const r = await fetch(`${BASE}/api/state?thread=${encodeURIComponent(sel)}`, {cache: "no-store"});
+    if (!r.ok) throw new Error(r.status);
+    state = await r.json();
+    $("#conn").textContent = "";
+  } catch (e) {
+    $("#conn").textContent = "offline";
+    return;
+  }
+  renderList();
+  renderThread();
+}
+
+function renderList() {
+  const showArch = $("#showArch").checked;
+  const list = $("#list");
+  list.replaceChildren();
+  const shown = state.threads.filter(t => showArch ? t.archived : !t.archived);
+  if (!shown.length) list.append(el("div", {class: "empty"}, showArch ? "No archived threads." : "No agents yet."));
+  for (const t of shown) {
+    list.append(el("div", {class: "item" + (t.id === sel ? " sel" : ""), onclick: () => select(t.id)},
+      el("span", {class: `dot ${t.state}`, title: t.state}),
+      el("div", {class: "body"},
+        el("div", {class: "top"}, el("span", {class: "title"}, t.title), t.muted ? el("span", {title: "texts muted"}, "🔕") : null,
+           t.unread ? el("span", {class: "badge"}, t.unread) : null, el("span", {class: "when"}, ago(t.updated))),
+        el("div", {class: "prev"}, `${statusText(t)}${t.preview ? " — " + t.preview : ""}`))));
+  }
+  const unread = state.threads.reduce((n, t) => n + (t.archived ? 0 : t.unread), 0);
+  const blocked = state.threads.filter(t => !t.archived && t.state === "blocked").length;
+  document.title = (unread ? `(${unread}) ` : "") + (blocked ? `${blocked} waiting · ` : "") + "dawg inbox";
+  const cwds = [...new Set(state.threads.map(t => t.cwd).filter(Boolean))];
+  $("#cwds").replaceChildren(...cwds.map(c => el("option", {value: c})));
+}
+
+function select(id) {
+  sel = id;
+  history.replaceState(null, "", id ? `#t=${id}` : location.pathname);
+  $("#app").classList.toggle("open", !!id);
+  renderedThread = "";
+  refresh();
+}
+
+function thread() { return state.threads.find(t => t.id === sel); }
+
+function renderThread() {
+  const t = thread();
+  const main = $("#main");
+  if (!t) {
+    renderedThread = "";
+    main.replaceChildren(el("div", {class: "empty"}, sel ? "Thread not found." : "Pick a thread."));
+    return;
+  }
+  if (renderedThread !== t.id) {
+    renderedThread = t.id; renderedSeq = {}; lastSeq = 0;
+    main.replaceChildren(
+      el("div", {class: "thead", id: "thead"}),
+      el("div", {class: "msgs", id: "msgs"}),
+      el("div", {class: "hint", id: "hint"}),
+      el("div", {class: "compose"},
+        el("textarea", {id: "draft", rows: 1, placeholder: "Message",
+                        onkeydown: e => { if (e.key === "Enter" && !e.shiftKey && !matchMedia("(pointer:coarse)").matches) { e.preventDefault(); sendDraft(); } },
+                        oninput: e => { e.target.style.height = "auto"; e.target.style.height = e.target.scrollHeight + "px"; }}),
+        el("button", {class: "primary", onclick: sendDraft}, "Send")));
+  }
+  renderHead(t);
+  const box = $("#msgs");
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  let added = false;
+  for (const x of state.entries || []) {
+    const key = JSON.stringify(x);
+    if (renderedSeq[x.seq] && renderedSeq[x.seq].key === key) continue;
+    const node = renderEntry(x, t);
+    if (renderedSeq[x.seq]) renderedSeq[x.seq].node.replaceWith(node);
+    else { box.append(node); added = true; }
+    renderedSeq[x.seq] = {key, node};
+  }
+  if (added && (atBottom || lastSeq === 0)) box.scrollTop = box.scrollHeight;
+  const maxSeq = (state.entries || []).reduce((m, x) => Math.max(m, x.seq), 0);
+  if (maxSeq > lastSeq) { lastSeq = maxSeq; if (t.unread && !document.hidden) api("thread", {thread: t.id, read: true}).catch(() => {}); }
+  const open = (state.entries || []).filter(x => x.kind === "ask" && x.open);
+  const single = open.find(x => x.questions.length === 1 && x.allow_text);
+  $("#hint").textContent = single ? "Your message answers the open question above."
+    : open.length ? "The agent is waiting on the question above; messages queue until it checks in."
+    : t.state === "busy" ? "Messages queue until the agent checks in." : "";
+}
+
+function renderHead(t) {
+  const h = t.herdr;
+  const live = h ? (h.live || (h.workspace ? "gone" : "starting")) : null;
+  const btn = (label, fn, title) => el("button", {onclick: fn, title}, label);
+  $("#thead").replaceChildren(...[
+    el("button", {class: "back", onclick: () => select("")}, "‹"),
+    el("div", {class: "name"}, el("b", {}, t.title), el("small", {}, t.cwd || "")),
+    el("span", {class: "pill"}, el("span", {class: `dot ${t.state}`}), statusText(t)),
+    h ? el("span", {class: "pill", title: `herdr agent ${h.agent}`}, `herdr: ${live}`) : null,
+    h && h.workspace ? btn("Terminal", openTerm) : null,
+    btn(t.muted ? "🔕 Texts off" : "🔔 Texts on", () => api("thread", {thread: t.id, muted: !t.muted}).then(refresh),
+        "Turn phone texts for this thread on or off; the inbox still updates"),
+    btn(t.archived ? "Unarchive" : "Archive", () => api("thread", {thread: t.id, archived: !t.archived}).then(refresh)),
+    h && h.workspace && h.live ? btn("Close", closeAgent, "Close the agent's herdr workspace") : null,
+  ].filter(Boolean));
+}
+
+function renderEntry(x, t) {
+  const meta = txt => el("div", {class: "meta"}, txt);
+  if (x.kind === "text") {
+    const delivered = x.from === "user" && x.seq <= t.delivered;
+    return el("div", {class: `msg ${x.from}`}, x.body,
+              meta(clock(x.ts) + (x.from === "user" ? (delivered ? " · delivered" : " · queued") : "")));
+  }
+  if (x.kind === "status") {
+    return el("div", {class: "sys"}, el("span", {class: `dot ${x.status}`, style: "display:inline-block;margin:0 4px 0 0;width:7px;height:7px"}),
+              `${x.status}${x.note ? " · " + x.note : ""} · ${clock(x.ts)}`);
+  }
+  if (x.kind === "system") return el("div", {class: "sys"}, `${x.body} · ${clock(x.ts)}`);
+  if (x.kind === "result") {
+    const r = x.result;
+    return el("div", {class: "msg agent"}, el("div", {class: r.ok ? "ok" : "bad"}, `Action ${r.action}: ${r.status}`),
+              el("pre", {}, r.output), meta(clock(x.ts)));
+  }
+  if (x.kind === "answer") {
+    return el("div", {class: "msg user answer"},
+      x.answers.map(a => el("div", {}, a.option === "message" ? a.text : el("b", {}, a.option),
+                                   a.option !== "message" && a.text ? ` — ${a.text}` : "")),
+      meta(clock(x.ts)));
+  }
+  if (x.kind === "ask") return renderAsk(x, t);
+  return el("div", {class: "sys"}, x.kind);
+}
+
+function renderAsk(x, t) {
+  const card = el("div", {class: "msg agent ask"});
+  const multi = x.questions.length > 1;
+  const picks = x.questions.map(() => ({option: "", text: ""}));
+  const err = el("div", {class: "err"});
+  const submit = async (answers) => {
+    err.textContent = "";
+    card.querySelectorAll("button").forEach(b => b.disabled = true);
+    try { await api("answer", {thread: t.id, rid: x.rid, answers}); await refresh(); }
+    catch (e) { err.textContent = e.message; card.querySelectorAll("button").forEach(b => b.disabled = false); }
+  };
+  x.questions.forEach((q, i) => {
+    const qn = el("div", {class: "q"}, el("div", {}, (multi ? `${i + 1}. ` : "") + q.message));
+    if (x.open) {
+      const opts = el("div", {class: "opts"});
+      for (const o of q.options) {
+        const b = el("button", {onclick: () => {
+          if (!multi) return submit([{option: o, text: picks[0].text}]);
+          picks[i].option = picks[i].option === o ? "" : o;
+          opts.querySelectorAll("button").forEach(n => n.classList.toggle("on", n.dataset.o === picks[i].option));
+        }}, o, x.runs[o] ? el("small", {}, `runs: ${x.runs[o]}`) : null);
+        b.dataset.o = o;
+        opts.append(b);
+      }
+      if (q.options.length) qn.append(opts);
+      if (x.allow_text) {
+        qn.append(el("textarea", {rows: 2, placeholder: q.options.length ? "Note, or your own instruction" : "Reply",
+                                  oninput: e => { picks[i].text = e.target.value; }}));
+        if (!multi) qn.append(el("div", {class: "row"},
+          el("button", {class: "primary", onclick: () => picks[0].text.trim() ? submit([{option: "message", text: picks[0].text}]) : (err.textContent = "Write a message first.")},
+             q.options.length ? "Do this instead" : "Send")));
+      }
+    }
+    card.append(qn);
+  });
+  if (x.open && multi) {
+    card.append(el("div", {class: "row"}, el("button", {class: "primary", onclick: () =>
+      submit(picks.map(p => p.option ? p : {option: "message", text: p.text}))}, "Send answers")));
+  }
+  card.append(err);
+  const status = x.answers ? "answered" : x.open ? `expires ${clock(x.expires)}` : "expired";
+  card.append(el("div", {class: "meta"}, `${clock(x.ts)} · ${status}`));
+  return card;
+}
+
+async function sendDraft() {
+  const ta = $("#draft");
+  const text = ta.value.trim();
+  if (!text) return;
+  ta.disabled = true;
+  try { await api("send", {thread: sel, text}); ta.value = ""; ta.style.height = "auto"; await refresh(); }
+  catch (e) { $("#hint").textContent = e.message; }
+  ta.disabled = false; ta.focus();
+}
+
+// -- herdr
+
+async function termRead() {
+  $("#termErr").textContent = "";
+  const t = thread();
+  $("#termState").textContent = t && t.herdr ? `${t.herdr.agent} · ${t.herdr.live || "not running"}` : "";
+  try {
+    const out = $("#termOut");
+    out.textContent = (await api("herdr", {thread: sel, op: "read"})).output;
+    out.scrollTop = out.scrollHeight;
+  } catch (e) { $("#termErr").textContent = e.message; }
+}
+function openTerm() {
+  $("#termKeys").replaceChildren(...state.keys.map(k => el("button", {onclick: async () => {
+    try { await api("herdr", {thread: sel, op: "keys", key: k}); setTimeout(termRead, 400); }
+    catch (e) { $("#termErr").textContent = e.message; }
+  }}, k)));
+  $("#termOut").textContent = "…";
+  $("#termDlg").showModal();
+  termRead();
+}
+$("#termRefresh").onclick = termRead;
+$("#termClose").onclick = () => $("#termDlg").close();
+$("#termSend").onclick = async () => {
+  const text = $("#termText").value.trim();
+  if (!text) return;
+  try { await api("herdr", {thread: sel, op: "prompt", text}); $("#termText").value = ""; setTimeout(termRead, 800); }
+  catch (e) { $("#termErr").textContent = e.message; }
+};
+async function closeAgent() {
+  if (!confirm("Close this agent's herdr workspace? The agent stops; the thread stays here.")) return;
+  try { await api("herdr", {thread: sel, op: "close"}); await refresh(); }
+  catch (e) { alert(e.message); }
+}
+
+$("#newBtn").onclick = () => {
+  $("#nKind").replaceChildren(...state.kinds.map(k => el("option", {value: k}, k)));
+  $("#nErr").textContent = state.herdr ? "" : "herdr isn't installed on this machine.";
+  $("#newDlg").showModal();
+};
+$("#newForm").addEventListener("submit", async e => {
+  if (e.submitter && e.submitter.value === "cancel") return;
+  e.preventDefault();
+  $("#nGo").disabled = true; $("#nErr").textContent = "";
+  try {
+    const r = await api("start", {cwd: $("#nCwd").value, kind: $("#nKind").value, title: $("#nTitle").value, task: $("#nTask").value});
+    $("#newDlg").close(); $("#nTask").value = ""; $("#nTitle").value = "";
+    select(r.thread);
+  } catch (err) { $("#nErr").textContent = err.message; }
+  $("#nGo").disabled = false;
+});
+
+$("#showArch").onchange = renderList;
+$("#actionsLink").href = BASE.replace(/\/m\//, "/a/");
+window.addEventListener("hashchange", () => {
+  const t = new URLSearchParams(location.hash.slice(1)).get("t") || "";
+  if (t !== sel) select(t);
+});
+function schedule() {
+  clearInterval(polling);
+  polling = setInterval(refresh, document.hidden ? 15000 : 2500);
+}
+document.addEventListener("visibilitychange", () => { schedule(); if (!document.hidden) refresh(); });
+if (sel) $("#app").classList.add("open");
+schedule();
+refresh();
+</script>
+</body>
+</html>

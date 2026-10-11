@@ -6,8 +6,13 @@
 #   echo MESSAGE | dawg [options]     send stdin as the message
 #   dawg [options] run -- CMD ARGS..  run a command, notify when it finishes
 #   dawg ask [-w] MESSAGE OPT [OPT..] ask for a reply (see: dawg ask -h)
+#   dawg status -T ID busy|blocked|idle [NOTE]   set a thread's inbox status
+#   dawg inbox -T ID [-w]             print messages queued from the inbox
+#   dawg thread new -t TITLE          start an inbox thread; prints its id
 #
 # Options:
+#   -T THREAD   post to this inbox thread too (default: $DAWG_THREAD); a
+#               thread muted in the inbox gets no texts
 #   -t TITLE    notification title (default: hostname)
 #   -g GROUP    group notifications in the app
 #   -l LEVEL    active | timeSensitive | passive | critical
@@ -20,10 +25,10 @@
 
 set -u
 
-if [[ "${1:-}" == "ask" ]]; then
-  shift
-  exec python3 "$(dirname "$(readlink -f "$0")")/dawgd.py" ask "$@"
-fi
+dawgd="$(dirname "$(readlink -f "$0")")/dawgd.py"
+case "${1:-}" in
+  ask|status|inbox|thread) exec python3 "$dawgd" "$@" ;;
+esac
 
 server="${DAWG_SERVER:-https://api.day.app}"
 key="${DAWG_KEY:-}"
@@ -36,15 +41,16 @@ if [[ -z "$key" ]]; then
 fi
 
 title="$(hostname)"
-group="" level="" sound="" url=""
-while getopts ":t:g:l:s:u:h" opt; do
+group="" level="" sound="" url="" thread="${DAWG_THREAD:-}"
+while getopts ":T:t:g:l:s:u:h" opt; do
   case "$opt" in
+    T) thread="$OPTARG" ;;
     t) title="$OPTARG" ;;
     g) group="$OPTARG" ;;
     l) level="$OPTARG" ;;
     s) sound="$OPTARG" ;;
     u) url="$OPTARG" ;;
-    h) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    h) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "dawg: bad option -$OPTARG" >&2; exit 2 ;;
   esac
 done
@@ -52,6 +58,15 @@ shift $((OPTIND - 1))
 
 send() {
   local body="$1"
+  if [[ -n "$thread" ]]; then  # dawgd posts it to the thread, then texts it unless muted
+    local opts=(-T "$thread" -t "$title")
+    [[ -n "$group" ]] && opts+=(-g "$group")
+    [[ -n "$level" ]] && opts+=(-l "$level")
+    [[ -n "$sound" ]] && opts+=(-s "$sound")
+    [[ -n "$url"   ]] && opts+=(-u "$url")
+    python3 "$dawgd" send "${opts[@]}" -- "$body"
+    return
+  fi
   local args=(-sS --max-time 10 -X POST "$server/$key"
     --data-urlencode "title=$title"
     --data-urlencode "body=$body")

@@ -82,3 +82,8 @@ fi
 echo
 echo "To accept replies from your phone, expose dawgd on your tailnet once:"
 echo "  tailscale serve --bg 8787"
+base_url="$(sed -n 's/^base_url *= *"\(.*\)"/\1/p' "$config/dawgd.toml")"
+if [[ -n "$base_url" && -s "$config/token" ]]; then
+  echo
+  echo "Inbox (bookmark it; the link is a secret): $base_url/m/$(cat "$config/token")"
+fi
