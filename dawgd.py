@@ -1,0 +1,383 @@
+#!/usr/bin/env python3
+"""dawgd - reply to Bark notifications from your phone.
+
+Subcommands:
+  dawgd.py serve                     run the reply server (Tailscale-only)
+  dawgd.py ask [opts] MESSAGE OPT..  send a request with reply options
+
+A request is a notification whose tap opens a page with one button per
+option. Options whose name matches an action in actions.toml run that
+action's fixed command when chosen; other options are just recorded so a
+waiting script can read them.
+
+Files:
+  ~/.config/dawg/actions.toml   documented action keys -> fixed commands
+  ~/.config/dawg/dawgd.toml     server settings (bind, port, base_url)
+  ~/.config/dawg/token          secret for the standing-actions page
+  ~/.local/state/dawg/          pending requests and answers
+"""
+
+import argparse
+import html
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs
+
+CONFIG_DIR = Path.home() / ".config" / "dawg"
+STATE_DIR = Path.home() / ".local" / "state" / "dawg"
+ACTIONS_FILE = CONFIG_DIR / "actions.toml"
+SETTINGS_FILE = CONFIG_DIR / "dawgd.toml"
+TOKEN_FILE = CONFIG_DIR / "token"
+DAWG = shutil.which("dawg") or str(Path(__file__).with_name("dawg"))
+
+DEFAULT_SETTINGS = {
+    "bind": "127.0.0.1",
+    "port": 8787,
+    "base_url": None,  # set in dawgd.toml; install.sh fills it in
+    "max_output": 1500,
+    "keep_days": 7,
+}
+
+answer_lock = threading.Lock()
+
+
+def load_settings():
+    settings = dict(DEFAULT_SETTINGS)
+    if SETTINGS_FILE.exists():
+        settings.update(tomllib.loads(SETTINGS_FILE.read_text()))
+    return settings
+
+
+def load_actions():
+    """Read actions.toml fresh each time so edits apply without a restart."""
+    if not ACTIONS_FILE.exists():
+        return {}
+    actions = tomllib.loads(ACTIONS_FILE.read_text()).get("action", {})
+    for key, a in actions.items():
+        if not isinstance(a.get("command"), list) or not a["command"]:
+            raise ValueError(f"action {key!r}: command must be a non-empty list")
+    return actions
+
+
+def get_token():
+    if not TOKEN_FILE.exists():
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_urlsafe(24) + "\n")
+    return TOKEN_FILE.read_text().strip()
+
+
+def notify(title, body, url=None, group="dawgd"):
+    cmd = [DAWG, "-t", title, "-g", group]
+    if url:
+        cmd += ["-u", url]
+    subprocess.run(cmd + [body], check=False, timeout=20)
+
+
+def run_action(key, action, max_output):
+    try:
+        p = subprocess.run(
+            action["command"],
+            capture_output=True,
+            text=True,
+            timeout=action.get("timeout", 30),
+            cwd=Path.home(),
+        )
+        out = (p.stdout + p.stderr).strip() or "(no output)"
+        ok = p.returncode == 0
+        status = "ok" if ok else f"exit {p.returncode}"
+    except subprocess.TimeoutExpired:
+        out, ok, status = "", False, "timed out"
+    except OSError as e:
+        out, ok, status = str(e), False, "failed to start"
+    if len(out) > max_output:
+        out = out[:max_output] + "\n…(truncated)"
+    return {"action": key, "ok": ok, "status": status, "output": out}
+
+
+# ---------------------------------------------------------------- requests
+
+def req_path(rid):
+    return STATE_DIR / f"{rid}.json"
+
+
+def ans_path(rid):
+    return STATE_DIR / f"{rid}.answer.json"
+
+
+def valid_id(rid):
+    return rid.isalnum() and 16 <= len(rid) <= 64
+
+
+def load_request(rid):
+    if not valid_id(rid) or not req_path(rid).exists():
+        return None
+    return json.loads(req_path(rid).read_text())
+
+
+def load_answer(rid):
+    p = ans_path(rid)
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def write_json(path, data):
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def purge_old(keep_days):
+    cutoff = time.time() - keep_days * 86400
+    for p in STATE_DIR.glob("*.json"):
+        if p.stat().st_mtime < cutoff:
+            p.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- web
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title}</title><style>
+:root{{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--muted:#6e6e73;--accent:#0a66d8;--ok:#1a7f37;--bad:#c62828}}
+@media (prefers-color-scheme:dark){{:root{{--bg:#000;--card:#1c1c1e;--fg:#f5f5f7;--muted:#98989d;--accent:#3d8bfd;--ok:#3fb950;--bad:#f85149}}}}
+body{{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:16px -apple-system,system-ui,sans-serif}}
+.card{{background:var(--card);border-radius:14px;padding:16px;margin:0 auto 12px;max-width:520px}}
+h1{{font-size:20px;margin:0 0 8px}} .muted{{color:var(--muted);font-size:14px}}
+.msg{{white-space:pre-wrap;margin:8px 0 4px}}
+button{{display:block;width:100%;margin:10px 0 0;padding:14px;border:0;border-radius:10px;
+background:var(--accent);color:#fff;font-size:17px;font-weight:600}}
+button small{{display:block;font-weight:400;opacity:.85;font-size:13px}}
+textarea{{width:100%;box-sizing:border-box;min-height:70px;margin-top:10px;padding:10px;border-radius:10px;
+border:1px solid var(--muted);background:var(--bg);color:var(--fg);font:inherit}}
+pre{{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:10px;border-radius:8px;font-size:13px}}
+.ok{{color:var(--ok)}} .bad{{color:var(--bad)}}
+</style></head><body>{body}</body></html>"""
+
+e = html.escape
+
+
+def fmt_time(ts):
+    return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def option_buttons(options, actions):
+    parts = []
+    for opt in options:
+        hint = ""
+        if opt in actions:
+            hint = f"<small>runs: {e(actions[opt].get('description') or ' '.join(actions[opt]['command']))}</small>"
+        parts.append(f'<button name="option" value="{e(opt)}">{e(opt)}{hint}</button>')
+    return "".join(parts)
+
+
+def result_block(result):
+    if not result:
+        return ""
+    cls = "ok" if result["ok"] else "bad"
+    return (f'<p class="{cls}">Action <b>{e(result["action"])}</b>: {e(result["status"])}</p>'
+            f'<pre>{e(result["output"])}</pre>')
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "dawgd"
+
+    def log_message(self, fmt, *args):
+        # Don't log full paths: they contain request ids and the token.
+        sys.stderr.write(f"{self.address_string()} {self.command} {self.path.split('/')[1:2]}\n")
+
+    def send_page(self, title, body, code=200):
+        data = PAGE.format(title=e(title), body=body).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def not_found(self):
+        self.send_page("Not found", '<div class="card"><h1>Not found</h1></div>', 404)
+
+    def read_form(self):
+        n = min(int(self.headers.get("Content-Length") or 0), 16384)
+        form = parse_qs(self.rfile.read(n).decode(errors="replace"))
+        return {k: v[0] for k, v in form.items()}
+
+    def route(self):
+        parts = [p for p in self.path.split("?")[0].split("/") if p]
+        if len(parts) == 2 and parts[0] == "r":
+            return "request", parts[1]
+        if len(parts) == 2 and parts[0] == "a" and secrets.compare_digest(parts[1], self.server.token):
+            return "standing", None
+        return None, None
+
+    def do_GET(self):
+        kind, rid = self.route()
+        if kind == "request":
+            self.show_request(rid)
+        elif kind == "standing":
+            self.show_standing()
+        else:
+            self.not_found()
+
+    def do_POST(self):
+        kind, rid = self.route()
+        form = self.read_form()
+        if kind == "request":
+            self.answer_request(rid, form)
+        elif kind == "standing":
+            self.run_standing(form)
+        else:
+            self.not_found()
+
+    # -- one-off requests
+
+    def show_request(self, rid, flash=""):
+        req = load_request(rid)
+        if not req:
+            return self.not_found()
+        actions = load_actions()
+        ans = load_answer(rid)
+        head = (f'<h1>{e(req["title"])}</h1><div class="msg">{e(req["message"])}</div>'
+                f'<div class="muted">sent {fmt_time(req["created"])}</div>')
+        if ans:
+            body = (f'{head}<p>Answered <b>{e(ans["option"])}</b> at {fmt_time(ans["answered_at"])}</p>'
+                    + (f'<pre>{e(ans["text"])}</pre>' if ans.get("text") else "")
+                    + result_block(ans.get("result")))
+        elif time.time() > req["expires"]:
+            body = f'{head}<p class="bad">Expired at {fmt_time(req["expires"])}.</p>'
+        else:
+            text = ('<textarea name="text" placeholder="Optional note"></textarea>'
+                    if req.get("allow_text") else "")
+            body = (f'{head}<form method="post">{text}{option_buttons(req["options"], actions)}</form>'
+                    f'<p class="muted">Expires {fmt_time(req["expires"])}</p>')
+        self.send_page(req["title"], flash + f'<div class="card">{body}</div>')
+
+    def answer_request(self, rid, form):
+        req = load_request(rid)
+        if not req:
+            return self.not_found()
+        option = form.get("option", "")
+        if option not in req["options"]:
+            return self.show_request(rid, '<div class="card bad">Unknown option.</div>')
+        with answer_lock:
+            if load_answer(rid):
+                return self.show_request(rid, '<div class="card bad">Already answered.</div>')
+            if time.time() > req["expires"]:
+                return self.show_request(rid)
+            ans = {"option": option, "text": form.get("text", "").strip(),
+                   "answered_at": time.time(), "result": None}
+            write_json(ans_path(rid), ans)
+        actions = load_actions()
+        if option in actions:
+            ans["result"] = run_action(option, actions[option], self.server.settings["max_output"])
+            write_json(ans_path(rid), ans)
+            r = ans["result"]
+            notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"])
+        self.show_request(rid)
+
+    # -- standing actions (bookmarkable)
+
+    def show_standing(self, flash=""):
+        actions = {k: a for k, a in load_actions().items() if a.get("standing")}
+        if actions:
+            form = f'<form method="post">{option_buttons(list(actions), actions)}</form>'
+        else:
+            form = '<p class="muted">No standing actions in actions.toml.</p>'
+        self.send_page("Actions", flash + f'<div class="card"><h1>Actions</h1>{form}</div>')
+
+    def run_standing(self, form):
+        actions = load_actions()
+        key = form.get("option", "")
+        if key not in actions or not actions[key].get("standing"):
+            return self.show_standing('<div class="card bad">Unknown action.</div>')
+        r = run_action(key, actions[key], self.server.settings["max_output"])
+        self.show_standing(f'<div class="card">{result_block(r)}</div>')
+
+
+def serve(_args):
+    settings = load_settings()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    load_actions()  # fail fast on a bad config
+    purge_old(settings["keep_days"])
+    srv = ThreadingHTTPServer((settings["bind"], settings["port"]), Handler)
+    srv.settings = settings
+    srv.token = get_token()
+    print(f"dawgd listening on {settings['bind']}:{settings['port']}", file=sys.stderr, flush=True)
+    srv.serve_forever()
+
+
+# ---------------------------------------------------------------- ask
+
+def ask(args):
+    settings = load_settings()
+    if not settings["base_url"]:
+        sys.exit(f"dawg ask: set base_url in {SETTINGS_FILE} (run install.sh)")
+    actions = load_actions()
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if len(set(args.options)) != len(args.options):
+        sys.exit("dawg ask: duplicate options")
+    rid = secrets.token_hex(16)
+    now = time.time()
+    req = {"id": rid, "title": args.title, "message": args.message, "options": args.options,
+           "allow_text": args.text, "created": now, "expires": now + args.expires}
+    write_json(req_path(rid), req)
+    runs = [o for o in args.options if o in actions]
+    hint = "Tap to reply: " + " / ".join(args.options)
+    if runs:
+        hint += f"  (runs: {', '.join(runs)})"
+    notify(args.title, f"{args.message}\n{hint}", url=f"{settings['base_url']}/r/{rid}",
+           group=args.group)
+    if not args.wait:
+        print(rid)
+        return 0
+    deadline = req["expires"]
+    while time.time() < deadline:
+        ans = load_answer(rid)
+        if ans:
+            # Give an action a moment to finish so --json can include its result.
+            if ans["option"] in actions and ans["result"] is None:
+                time.sleep(1)
+                continue
+            if args.json:
+                print(json.dumps(ans))
+            else:
+                print(ans["option"])
+                if ans.get("text"):
+                    print(ans["text"])
+            return 0
+        time.sleep(1)
+    print("dawg ask: expired without an answer", file=sys.stderr)
+    return 3
+
+
+def main():
+    p = argparse.ArgumentParser(prog="dawgd")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("serve").set_defaults(func=serve)
+    a = sub.add_parser("ask", prog="dawg ask",
+                       description="Send a notification with reply options.")
+    a.add_argument("-t", "--title", default=os.uname().nodename)
+    a.add_argument("-g", "--group", default="dawgd")
+    a.add_argument("-e", "--expires", type=int, default=3600, help="seconds (default 3600)")
+    a.add_argument("-w", "--wait", action="store_true", help="block until answered; print the option")
+    a.add_argument("--json", action="store_true", help="with --wait, print the full answer as JSON")
+    a.add_argument("--text", action="store_true", help="allow a free-text note with the reply")
+    a.add_argument("message")
+    a.add_argument("options", nargs="+")
+    a.set_defaults(func=ask)
+    args = p.parse_args()
+    sys.exit(args.func(args) or 0)
+
+
+if __name__ == "__main__":
+    main()

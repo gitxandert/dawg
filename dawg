@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# dawg - send push notifications to the Bark iOS app.
+#
+# Usage:
+#   dawg [options] MESSAGE            send a message
+#   echo MESSAGE | dawg [options]     send stdin as the message
+#   dawg [options] run -- CMD ARGS..  run a command, notify when it finishes
+#   dawg ask [-w] MESSAGE OPT [OPT..] ask for a reply (see: dawg ask -h)
+#
+# Options:
+#   -t TITLE    notification title (default: hostname)
+#   -g GROUP    group notifications in the app
+#   -l LEVEL    active | timeSensitive | passive | critical
+#   -s SOUND    sound name (e.g. alarm, bell, minuet)
+#   -u URL      URL to open when tapped
+#
+# Config:
+#   DAWG_KEY     device key (or put it in ~/.config/dawg/key)
+#   DAWG_SERVER  server URL (default: https://api.day.app)
+
+set -u
+
+if [[ "${1:-}" == "ask" ]]; then
+  shift
+  exec python3 "$(dirname "$(readlink -f "$0")")/dawgd.py" ask "$@"
+fi
+
+server="${DAWG_SERVER:-https://api.day.app}"
+key="${DAWG_KEY:-}"
+if [[ -z "$key" && -r "$HOME/.config/dawg/key" ]]; then
+  key="$(tr -d '[:space:]' < "$HOME/.config/dawg/key")"
+fi
+if [[ -z "$key" ]]; then
+  echo "dawg: no device key; set DAWG_KEY or write it to ~/.config/dawg/key" >&2
+  exit 2
+fi
+
+title="$(hostname)"
+group="" level="" sound="" url=""
+while getopts ":t:g:l:s:u:h" opt; do
+  case "$opt" in
+    t) title="$OPTARG" ;;
+    g) group="$OPTARG" ;;
+    l) level="$OPTARG" ;;
+    s) sound="$OPTARG" ;;
+    u) url="$OPTARG" ;;
+    h) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "dawg: bad option -$OPTARG" >&2; exit 2 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+send() {
+  local body="$1"
+  local args=(-sS --max-time 10 -X POST "$server/$key"
+    --data-urlencode "title=$title"
+    --data-urlencode "body=$body")
+  [[ -n "$group" ]] && args+=(--data-urlencode "group=$group")
+  [[ -n "$level" ]] && args+=(--data-urlencode "level=$level")
+  [[ -n "$sound" ]] && args+=(--data-urlencode "sound=$sound")
+  [[ -n "$url"   ]] && args+=(--data-urlencode "url=$url")
+  local resp
+  if ! resp="$(curl "${args[@]}")"; then
+    echo "dawg: request failed" >&2
+    return 1
+  fi
+  if [[ "$resp" != *'"code":200'* ]]; then
+    echo "dawg: server error: $resp" >&2
+    return 1
+  fi
+}
+
+if [[ "${1:-}" == "run" ]]; then
+  shift
+  [[ "${1:-}" == "--" ]] && shift
+  if [[ $# -eq 0 ]]; then
+    echo "dawg: run needs a command" >&2
+    exit 2
+  fi
+  start=$(date +%s)
+  "$@"
+  status=$?
+  elapsed=$(( $(date +%s) - start ))
+  dur=$(printf '%dh%02dm%02ds' $((elapsed/3600)) $((elapsed%3600/60)) $((elapsed%60)))
+  if [[ $status -eq 0 ]]; then
+    send "✅ $* — finished in $dur"
+  else
+    send "❌ $* — exit $status after $dur"
+  fi
+  exit $status
+fi
+
+if [[ $# -gt 0 ]]; then
+  msg="$*"
+elif [[ ! -t 0 ]]; then
+  msg="$(cat)"
+else
+  echo "dawg: no message (try -h)" >&2
+  exit 2
+fi
+send "$msg"

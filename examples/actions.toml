@@ -1,0 +1,31 @@
+# Actions you can trigger from your phone.
+#
+# [action.<key>]
+#   command     = ["argv", "list"]   run directly, no shell; the only thing <key> can do
+#   description = "shown on the button"
+#   timeout     = 30                 seconds (default 30)
+#   standing    = true               also show on the bookmarkable Actions page
+#
+# When a `dawg ask` option has the same name as a key here, choosing it runs
+# that command. Any other option is just recorded as the answer.
+# Edits apply immediately; no restart needed.
+
+[action.ping]
+command = ["echo", "pong"]
+description = "Check that dawgd is alive"
+standing = true
+
+[action.uptime]
+command = ["uptime"]
+description = "Uptime and load average"
+standing = true
+
+[action.disk]
+command = ["df", "-h", "--output=target,size,used,avail,pcent", "/", "/home"]
+description = "Disk usage for / and /home"
+standing = true
+
+[action.memory]
+command = ["free", "-h"]
+description = "Memory usage"
+standing = true
