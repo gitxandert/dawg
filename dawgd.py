@@ -78,6 +78,9 @@ DEFAULT_SETTINGS = {
     "keep_days": 7,
     "thread_keep_days": 30,
     "herdr_session": None,  # run herdr against a named session instead of the default
+    # What tapping a text opens. Bark hands every link to the browser as a new
+    # tab, so by default a tap does nothing and the inbox stays the one tab.
+    "tap": "none",  # or "questions": asks link to the inbox; "all": every text does
 }
 
 answer_lock = threading.Lock()
@@ -111,8 +114,9 @@ def get_token():
 
 
 def notify(title, body, url=None, group="dawgd", level=None, sound=None):
+    """Send a text. Without a url, tapping it does nothing (Bark's action=none)."""
     cmd = [DAWG, "-t", title, "-g", group]
-    for flag, value in (("-u", url), ("-l", level), ("-s", sound)):
+    for flag, value in (("-u", url), ("-a", None if url else "none"), ("-l", level), ("-s", sound)):
         if value:
             cmd += [flag, value]
     # DAWG_DIRECT: dawg sends the text instead of posting it to a thread again.
@@ -239,7 +243,7 @@ def run_answer_actions(rid, req, ans, max_output):
             if meta:
                 post(meta["id"], {"kind": "result", "from": "system", "rid": rid, "result": r})
             notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"],
-                   url=thread_link(load_settings(), meta) if meta else None)
+                   url=tap_link(load_settings(), meta) if meta else None)
 
 
 def check_answers(req, answers):
@@ -318,6 +322,13 @@ def thread_link(settings, meta, rid=None):
     if "key" not in meta:  # threads from before thread links
         meta = update_thread(meta["id"], lambda m: m.setdefault("key", secrets.token_urlsafe(18)))
     return f"{settings['base_url']}/i/{meta['key']}#t={meta['id']}" + (f"&r={rid}" if rid else "")
+
+
+def tap_link(settings, meta, rid=None):
+    """The link for a text, if the tap setting gives this kind of text one."""
+    if settings["tap"] == "all" or (settings["tap"] == "questions" and rid):
+        return thread_link(settings, meta, rid)
+    return None
 
 
 def thread_by_key(key):
@@ -971,7 +982,7 @@ def ask(args):
     if meta["muted"]:
         print("dawg ask: texts are muted for this thread; the question is in the inbox",
               file=sys.stderr)
-    elif not notify(args.title, body, url=thread_link(settings, meta, rid), group=args.group):
+    elif not notify(args.title, body, url=tap_link(settings, meta, rid), group=args.group):
         req_path(rid).unlink(missing_ok=True)
         print("dawg ask: notification not sent; nothing to wait for", file=sys.stderr)
         return 4
@@ -1034,7 +1045,7 @@ def send_cmd(args):
     meta = thread_for(args)
     post(meta["id"], {"kind": "text", "from": "agent", "body": args.message})
     if not meta["muted"]:
-        url = args.url or thread_link(load_settings(), meta)
+        url = args.url or tap_link(load_settings(), meta)
         if not notify(args.title, args.message, url=url, group=args.group,
                       level=args.level, sound=args.sound):
             print("dawg: posted to the inbox, but the text wasn't sent", file=sys.stderr)

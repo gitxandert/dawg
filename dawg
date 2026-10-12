@@ -19,6 +19,7 @@
 #   -l LEVEL    active | timeSensitive | passive | critical
 #   -s SOUND    sound name (e.g. alarm, bell, minuet)
 #   -u URL      URL to open when tapped
+#   -a ACTION   Bark tap action; "none" makes tapping do nothing
 #
 # Config:
 #   DAWG_KEY     device key (or put it in ~/.config/dawg/key)
@@ -42,8 +43,8 @@ if [[ -z "$key" ]]; then
 fi
 
 title="$(hostname)"
-group="" level="" sound="" url="" thread="${DAWG_THREAD:-notifications}"
-while getopts ":T:t:g:l:s:u:h" opt; do
+group="" level="" sound="" url="" action="" thread="${DAWG_THREAD:-notifications}"
+while getopts ":T:t:g:l:s:u:a:h" opt; do
   case "$opt" in
     T) thread="$OPTARG" ;;
     t) title="$OPTARG" ;;
@@ -51,7 +52,8 @@ while getopts ":T:t:g:l:s:u:h" opt; do
     l) level="$OPTARG" ;;
     s) sound="$OPTARG" ;;
     u) url="$OPTARG" ;;
-    h) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    a) action="$OPTARG" ;;
+    h) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "dawg: bad option -$OPTARG" >&2; exit 2 ;;
   esac
 done
@@ -76,6 +78,7 @@ send() {
   [[ -n "$level" ]] && args+=(--data-urlencode "level=$level")
   [[ -n "$sound" ]] && args+=(--data-urlencode "sound=$sound")
   [[ -n "$url"   ]] && args+=(--data-urlencode "url=$url")
+  [[ -n "$action" ]] && args+=(--data-urlencode "action=$action")
   local resp
   if ! resp="$(curl "${args[@]}")"; then
     echo "dawg: request failed" >&2
