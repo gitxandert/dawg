@@ -60,8 +60,9 @@ dawg inbox -T "$id"                                    # messages you sent from 
 dawg inbox -T "$id" -w                                 # wait for one
 ```
 
-`DAWG_THREAD` sets the default for `-T`. A thread muted in the inbox gets no
-texts; everything still shows up in the inbox.
+`DAWG_THREAD` sets the default for `-T`. Texts sent without a thread (plain
+`dawg`, `dawg run`) go to a Notifications thread. A thread muted in the inbox
+gets no texts; everything still shows up in the inbox.
 
 ## Inbox
 
@@ -74,6 +75,14 @@ can:
 - send it a message: it answers an open question if there's exactly one,
   otherwise it queues until the agent runs `dawg inbox`;
 - turn its texts off or on, and archive it.
+
+Every text links to its thread. The link carries that thread's own key, not
+the inbox token, since links pass through Bark's push server. Opening your
+bookmark signs that browser in with a cookie, and from then on links open
+the full inbox at the thread (and at the question, for an ask). In a
+browser that isn't signed in, a link shows just its thread. When a link
+opens a new tab, older inbox tabs in the same browser close themselves
+where the browser allows it.
 
 **New agent** starts Claude Code or Codex in a new herdr workspace, in the
 directory you pick, with your task. Its thread is set through `DAWG_THREAD`,

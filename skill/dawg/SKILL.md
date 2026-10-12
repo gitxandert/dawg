@@ -42,7 +42,8 @@ At the start of away mode:
 
 Pass `-T <id>` on every `dawg` call: `dawg -T`, `dawg ask -T`,
 `dawg status -T`, `dawg inbox -T`. The Bash tool doesn't keep exported
-variables between calls, so write the id out each time.
+variables between calls, so write the id out each time. A call without one
+lands in the shared Notifications thread instead of yours.
 
 - **Status:** `dawg status -T <id> busy "<what you're doing>"` when you start
   or change tasks, `idle` when you're waiting with nothing to do. An open

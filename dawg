@@ -11,8 +11,9 @@
 #   dawg thread new -t TITLE          start an inbox thread; prints its id
 #
 # Options:
-#   -T THREAD   post to this inbox thread too (default: $DAWG_THREAD); a
-#               thread muted in the inbox gets no texts
+#   -T THREAD   inbox thread to post to (default: $DAWG_THREAD, else the
+#               Notifications thread); the text links to it, and a thread
+#               muted in the inbox gets no texts
 #   -t TITLE    notification title (default: hostname)
 #   -g GROUP    group notifications in the app
 #   -l LEVEL    active | timeSensitive | passive | critical
@@ -41,7 +42,7 @@ if [[ -z "$key" ]]; then
 fi
 
 title="$(hostname)"
-group="" level="" sound="" url="" thread="${DAWG_THREAD:-}"
+group="" level="" sound="" url="" thread="${DAWG_THREAD:-notifications}"
 while getopts ":T:t:g:l:s:u:h" opt; do
   case "$opt" in
     T) thread="$OPTARG" ;;
@@ -58,7 +59,8 @@ shift $((OPTIND - 1))
 
 send() {
   local body="$1"
-  if [[ -n "$thread" ]]; then  # dawgd posts it to the thread, then texts it unless muted
+  # dawgd posts it to the thread, then calls back here with DAWG_DIRECT set to text it.
+  if [[ -z "${DAWG_DIRECT:-}" ]]; then
     local opts=(-T "$thread" -t "$title")
     [[ -n "$group" ]] && opts+=(-g "$group")
     [[ -n "$level" ]] && opts+=(-l "$level")

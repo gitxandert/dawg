@@ -32,6 +32,8 @@ Files:
 import argparse
 import contextlib
 import fcntl
+import hashlib
+import hmac
 import html
 import json
 import os
@@ -58,6 +60,9 @@ DAWG = shutil.which("dawg") or str(Path(__file__).with_name("dawg"))
 HERDR = shutil.which("herdr")
 
 STATUSES = ("busy", "blocked", "idle")
+# Texts sent without a thread land here.
+NOTIFICATIONS = "notifications"
+COOKIE = "dawg_inbox"
 # Agents the inbox can start in herdr, and the keys it can press for them.
 AGENT_KINDS = ("claude", "codex")
 HERDR_KEYS = ("enter", "esc", "up", "down", "tab", "ctrl+c", "1", "2", "3", "y", "n")
@@ -110,8 +115,8 @@ def notify(title, body, url=None, group="dawgd", level=None, sound=None):
     for flag, value in (("-u", url), ("-l", level), ("-s", sound)):
         if value:
             cmd += [flag, value]
-    # Without DAWG_THREAD, so dawg sends the text instead of posting to the thread again.
-    env = {k: v for k, v in os.environ.items() if k != "DAWG_THREAD"}
+    # DAWG_DIRECT: dawg sends the text instead of posting it to a thread again.
+    env = {**os.environ, "DAWG_DIRECT": "1"}
     try:
         return subprocess.run(cmd + ["--", body], check=False, timeout=20, env=env).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
@@ -230,9 +235,11 @@ def run_answer_actions(rid, req, ans, max_output):
             a["result"] = run_action(option, actions[option], max_output)
             write_json(ans_path(rid), ans)
             r = a["result"]
-            if req.get("thread") and load_thread(req["thread"]):
-                post(req["thread"], {"kind": "result", "from": "system", "rid": rid, "result": r})
-            notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"])
+            meta = load_thread(req.get("thread", ""))
+            if meta:
+                post(meta["id"], {"kind": "result", "from": "system", "rid": rid, "result": r})
+            notify(f"{'✅' if r['ok'] else '❌'} {option}", r["output"],
+                   url=thread_link(load_settings(), meta) if meta else None)
 
 
 def check_answers(req, answers):
@@ -292,11 +299,35 @@ def new_thread(title, cwd=None, tid=None, herdr=None):
     meta = {"id": tid, "title": title, "cwd": cwd, "created": now, "updated": now,
             "status": "idle", "status_note": "", "muted": False, "archived": False,
             "seq": 0, "delivered": 0, "unread": 0, "preview": "", "open_asks": [],
-            "herdr": herdr}
+            "herdr": herdr, "key": secrets.token_urlsafe(18)}
     with thread_lock(tid):
         if not thread_path(tid).exists():
             write_json(thread_path(tid), meta)
     return load_thread(tid)
+
+
+def thread_link(settings, meta, rid=None):
+    """The link a text opens: this thread in the inbox, at question rid if given.
+
+    It carries the thread's own key, never the inbox token: a browser that
+    has opened the inbox bookmark is sent on to the full inbox, any other
+    sees just this thread.
+    """
+    if not settings["base_url"]:
+        return None
+    if "key" not in meta:  # threads from before thread links
+        meta = update_thread(meta["id"], lambda m: m.setdefault("key", secrets.token_urlsafe(18)))
+    return f"{settings['base_url']}/i/{meta['key']}#t={meta['id']}" + (f"&r={rid}" if rid else "")
+
+
+def thread_by_key(key):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", key):
+        return None
+    for p in THREADS_DIR.glob("*.json"):
+        meta = json.loads(p.read_text())
+        if secrets.compare_digest(meta.get("key", ""), key):
+            return meta
+    return None
 
 
 def update_thread(tid, change):
@@ -525,36 +556,65 @@ class Handler(BaseHTTPRequestHandler):
         return {k: v[0] for k, v in form.items()}
 
     def route(self):
+        """Return (kind, arg, scope); scope is the one thread a thread link may see."""
         parts = [p for p in urlsplit(self.path).path.split("/") if p]
         if len(parts) == 2 and parts[0] == "r":
-            return "request", parts[1]
+            return "request", parts[1], None
+        if parts[:1] == ["i"] and len(parts) in (2, 4) and (meta := thread_by_key(parts[1])):
+            if len(parts) == 2:
+                return "link", None, meta["id"]
+            if parts[2] == "api":
+                return "api", parts[3], meta["id"]
         authed = len(parts) >= 2 and secrets.compare_digest(parts[1], self.server.token)
         if len(parts) == 2 and parts[0] == "a" and authed:
-            return "standing", None
+            return "standing", None, None
         if parts[:1] == ["m"] and authed:
             if len(parts) == 2:
-                return "inbox", None
+                return "inbox", None, None
             if len(parts) == 4 and parts[2] == "api":
-                return "api", parts[3]
-        return None, None
+                return "api", parts[3], None
+        return None, None, None
+
+    def session_cookie(self):
+        return hmac.new(self.server.token.encode(), b"inbox session", hashlib.sha256).hexdigest()
+
+    def signed_in(self):
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == COOKIE and secrets.compare_digest(value, self.session_cookie()):
+                return True
+        return False
 
     def do_GET(self):
-        kind, arg = self.route()
+        kind, arg, scope = self.route()
         if kind == "request":
             self.show_request(arg)
         elif kind == "standing":
             self.show_standing()
         elif kind == "inbox":
+            # Opening the bookmark signs this browser in, so thread links open the full inbox.
+            secure = "; Secure" if (self.server.settings["base_url"] or "").startswith("https:") else ""
+            self.send_file(INBOX_PAGE, "text/html; charset=utf-8", {
+                "Set-Cookie": f"{COOKIE}={self.session_cookie()}; Path=/; Max-Age=31536000; "
+                              f"HttpOnly; SameSite=Lax{secure}"})
+        elif kind == "link" and self.signed_in():
+            # The browser keeps the link's #t=…&r=… fragment across the redirect.
+            self.send_response(302)
+            self.send_header("Location", f"/m/{self.server.token}")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif kind == "link":
             self.send_file(INBOX_PAGE, "text/html; charset=utf-8")
         elif kind == "api" and arg == "state":
-            self.api_state(parse_qs(urlsplit(self.path).query))
+            self.api_state(parse_qs(urlsplit(self.path).query), scope)
         else:
             self.not_found()
 
     def do_POST(self):
-        kind, arg = self.route()
+        kind, arg, scope = self.route()
         if kind == "api":
-            return self.api_post(arg)
+            return self.api_post(arg, scope)
         form = self.read_form()
         if kind == "request":
             self.answer_request(arg, form)
@@ -563,10 +623,12 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.not_found()
 
-    def send_file(self, path, ctype):
+    def send_file(self, path, ctype, headers=None):
         data = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
@@ -583,12 +645,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- inbox (bookmarkable): every thread, its messages, and controls
 
-    def api_state(self, query):
+    def api_state(self, query, scope=None):
         settings = self.server.settings
-        agents = herdr_agents(settings)
+        agents = herdr_agents(settings) if not scope else {}
         threads = []
         for p in sorted(THREADS_DIR.glob("*.json")):
             meta = json.loads(p.read_text())
+            if scope and meta["id"] != scope:
+                continue
             meta["state"] = thread_status(meta)
             h = meta.get("herdr")
             if h:
@@ -600,8 +664,8 @@ class Handler(BaseHTTPRequestHandler):
             threads.append(meta)
         threads.sort(key=lambda m: m["updated"], reverse=True)
         out = {"threads": threads, "now": time.time(), "kinds": list(AGENT_KINDS),
-               "keys": list(HERDR_KEYS), "herdr": bool(HERDR)}
-        tid = query.get("thread", [""])[0]
+               "keys": list(HERDR_KEYS), "herdr": bool(HERDR) and not scope, "scope": scope}
+        tid = scope or query.get("thread", [""])[0]
         if load_thread(tid):
             actions = load_actions()
             entries = read_log(tid)[-500:]
@@ -624,9 +688,11 @@ class Handler(BaseHTTPRequestHandler):
             return {}
         return data if isinstance(data, dict) else {}
 
-    def api_post(self, name):
+    def api_post(self, name, scope=None):
         data = self.read_json()
         settings = self.server.settings
+        if scope and (name in ("start", "herdr") or data.get("thread") != scope):
+            return self.send_json({"error": "Open your inbox bookmark to do that."}, 403)
         if name == "start":
             return self.api_start(data)
         tid = str(data.get("thread", ""))
@@ -892,8 +958,7 @@ def ask(args):
     now = time.time()
     req = {"id": rid, "title": args.title, "questions": qs,
            "allow_text": args.text, "created": now, "expires": now + args.expires}
-    if meta:
-        req["thread"] = meta["id"]
+    req["thread"] = meta["id"]
     write_json(req_path(rid), req)
     first = qs[0]
     if len(qs) > 1:
@@ -903,17 +968,16 @@ def ask(args):
     runs = sorted({o for q in qs for o in q["options"] if o in actions})
     if runs:
         body += f"  (runs: {', '.join(runs)})"
-    if meta and meta["muted"]:
+    if meta["muted"]:
         print("dawg ask: texts are muted for this thread; the question is in the inbox",
               file=sys.stderr)
-    elif not notify(args.title, body, url=f"{settings['base_url']}/r/{rid}", group=args.group):
+    elif not notify(args.title, body, url=thread_link(settings, meta, rid), group=args.group):
         req_path(rid).unlink(missing_ok=True)
         print("dawg ask: notification not sent; nothing to wait for", file=sys.stderr)
         return 4
-    if meta:
-        post(meta["id"], {"kind": "ask", "from": "agent", "rid": rid, "questions": qs,
-                          "allow_text": args.text, "expires": req["expires"]},
-             lambda m: m["open_asks"].append(rid))
+    post(meta["id"], {"kind": "ask", "from": "agent", "rid": rid, "questions": qs,
+                      "allow_text": args.text, "expires": req["expires"]},
+         lambda m: m["open_asks"].append(rid))
     if not args.wait:
         print(rid)
         return 0
@@ -948,16 +1012,16 @@ def ask(args):
 
 # ---------------------------------------------------------------- thread commands
 
-def thread_for(args, required=False):
-    """The thread named by -T or DAWG_THREAD, created on first use; None if neither."""
-    tid = args.thread
-    if not tid:
-        if required:
-            sys.exit(f"dawg {args.cmd}: give a thread with -T, or set DAWG_THREAD")
-        return None
+def thread_for(args):
+    """The thread named by -T or DAWG_THREAD, else Notifications; created on first use."""
+    tid = args.thread or NOTIFICATIONS
     if not valid_thread(tid):
         sys.exit(f"dawg {args.cmd}: bad thread id {tid!r}")
-    return load_thread(tid) or new_thread(args.title, cwd=os.getcwd(), tid=tid)
+    if meta := load_thread(tid):
+        return meta
+    if tid == NOTIFICATIONS:
+        return new_thread("Notifications", tid=tid)
+    return new_thread(args.title, cwd=os.getcwd(), tid=tid)
 
 
 def queued_hint(tid):
@@ -967,10 +1031,11 @@ def queued_hint(tid):
 
 
 def send_cmd(args):
-    meta = thread_for(args, required=True)
+    meta = thread_for(args)
     post(meta["id"], {"kind": "text", "from": "agent", "body": args.message})
     if not meta["muted"]:
-        if not notify(args.title, args.message, url=args.url, group=args.group,
+        url = args.url or thread_link(load_settings(), meta)
+        if not notify(args.title, args.message, url=url, group=args.group,
                       level=args.level, sound=args.sound):
             print("dawg: posted to the inbox, but the text wasn't sent", file=sys.stderr)
             return 1
@@ -979,7 +1044,7 @@ def send_cmd(args):
 
 
 def status_cmd(args):
-    meta = thread_for(args, required=True)
+    meta = thread_for(args)
     note = " ".join(args.note)
     if (meta["status"], meta["status_note"]) != (args.status, note):
         post(meta["id"], {"kind": "status", "from": "agent", "status": args.status, "note": note},
@@ -989,7 +1054,7 @@ def status_cmd(args):
 
 
 def inbox_cmd(args):
-    meta = thread_for(args, required=True)
+    meta = thread_for(args)
     deadline = time.time() + args.expires
     while True:
         msgs = take_queued(meta["id"])
@@ -1025,7 +1090,7 @@ def main():
     def threaded(name, **kw):
         c = sub.add_parser(name, prog=f"dawg {name}", **kw)
         c.add_argument("-T", "--thread", default=env_thread,
-                       help="inbox thread id (default: $DAWG_THREAD)")
+                       help="inbox thread id (default: $DAWG_THREAD, else Notifications)")
         c.add_argument("-t", "--title", default=os.uname().nodename,
                        help="title; also names a thread it creates")
         return c
