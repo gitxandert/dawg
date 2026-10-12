@@ -747,6 +747,21 @@ def herdr(settings, *args, timeout=30):
         return p.stdout
 
 
+def submit_prompt(settings, target, text):
+    """Type text into the agent and submit it.
+
+    The agent can take the Enter after a long paste as part of the paste,
+    leaving the text sitting in its prompt; press Enter again if it doesn't start.
+    """
+    try:
+        herdr(settings, "agent", "prompt", target, text, "--wait", "--until", "working",
+              "--until", "blocked", "--timeout", "8000", timeout=20)
+    except HerdrError as err:
+        if err.code not in ("agent_prompt_stalled", "timeout"):
+            raise
+        herdr(settings, "agent", "send-keys", target, "enter", timeout=10)
+
+
 def herdr_agents(settings):
     """Live herdr agents by name, refreshed at most every few seconds."""
     with herdr_cache_lock:
@@ -814,7 +829,7 @@ def launch_agent(settings, meta, cmd, prompt):
         wait_ready(settings, pane, 60, kind)
         herdr(settings, "agent", "rename", pane, name, timeout=10)
         update_thread(tid, lambda m: m["herdr"].update(agent=name))
-        herdr(settings, "agent", "prompt", pane, prompt, timeout=15)
+        submit_prompt(settings, pane, prompt)
     finally:
         launching.discard(tid)
 
@@ -947,8 +962,8 @@ def deliver(settings, tid):
         if not live or live.get("agent_status") not in ("idle", "done"):
             return False
         try:
-            herdr(settings, "agent", "prompt", herdr_target(meta),
-                  inbox_prompt(kind, tid, "\n\n".join(m["body"] for m in msgs)), timeout=15)
+            submit_prompt(settings, herdr_target(meta),
+                          inbox_prompt(kind, tid, "\n\n".join(m["body"] for m in msgs)))
         except HerdrError:
             return False
         seq = msgs[-1]["seq"]
@@ -983,7 +998,7 @@ def prompt_when_ready(settings, pane, kind, prompt, note):
     while True:
         try:
             wait_ready(settings, pane, max(deadline - time.time(), 0), kind)
-            return herdr(settings, "agent", "prompt", pane, prompt, timeout=15)
+            return submit_prompt(settings, pane, prompt)
         except HerdrError as err:
             # It went idle, then showed another dialog before the prompt went in.
             if err.code != "agent_blocked":
@@ -1349,7 +1364,7 @@ class Handler(BaseHTTPRequestHandler):
                 text = str(data.get("text", "")).strip()
                 if not text:
                     return self.send_json({"error": "Write a prompt first."}, 400)
-                herdr(settings, "agent", "prompt", herdr_target(meta), text, timeout=15)
+                submit_prompt(settings, herdr_target(meta), text)
                 post(meta["id"], {"kind": "system", "from": "system",
                                   "body": f"Typed into the terminal: {text}"})
                 return self.send_json({"ok": True})
