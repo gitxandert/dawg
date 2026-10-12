@@ -73,7 +73,9 @@ can:
 
 - answer its questions inline, the same as from a notification;
 - send it a message: it answers an open question if there's exactly one,
-  otherwise it queues until the agent runs `dawg inbox`;
+  otherwise it queues until the agent runs `dawg inbox`. An agent in herdr
+  that's idle and isn't waiting on `dawg inbox -w` gets it typed into its
+  terminal, marked as coming from the inbox so it stays in away mode;
 - turn its texts off or on, and archive it.
 
 Keep the inbox open in one tab, or add it to your home screen (in Safari or
@@ -134,9 +136,10 @@ to that agent only and doesn't touch your defaults the way `/model` would.
 It stops whatever the agent was running in the background, closes its open
 questions, and tells it to re-ask. Agents in a plain terminal show their
 settings, but dawg can't type into their terminal to change them. **New
-agent** also takes a model and effort. If a new agent stops at a startup
-prompt (trusting the folder, an update notice), the thread says so; answer
-it from **Terminal** and the task goes in once it's ready.
+agent** also takes a model and effort, and marks the folder trusted
+(unless you untick it) so the agent doesn't ask in its terminal. If a new
+agent still stops at a startup prompt (an update notice, say), the thread
+says so; answer it from **Terminal** and the task goes in once it's ready.
 
 To use the skill, tell the agent you're stepping away, or run `/dawg`. It
 texts you its questions until you type in the terminal again. When it finishes

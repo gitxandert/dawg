@@ -213,7 +213,7 @@ def purge_old(keep_days, thread_keep_days):
     cutoff = time.time() - thread_keep_days * 86400
     for p in THREADS_DIR.glob("*.json"):
         if p.stat().st_mtime < cutoff:
-            for suffix in (".json", ".log.jsonl", ".lock"):
+            for suffix in (".json", ".log.jsonl", ".lock", ".wait"):
                 p.with_name(p.stem + suffix).unlink(missing_ok=True)
 
 
@@ -673,6 +673,15 @@ def poll_loop(settings):
         time.sleep(10)
 
 
+def deliver_loop(settings):
+    while True:
+        try:
+            deliver_all(settings)
+        except Exception as err:  # keep going; a thread file can be mid-write
+            print(f"dawgd: delivering messages: {err}", file=sys.stderr, flush=True)
+        time.sleep(3)
+
+
 def model_suggestions():
     """Models the inbox offers per agent kind: the fixed Claude aliases, and Codex models seen."""
     seen = {m for p in THREADS_DIR.glob("*.json")
@@ -799,11 +808,15 @@ def launch_agent(settings, meta, cmd, prompt):
     usage = meta.get("usage") or {}
     if kind == "codex" and usage.get("provider") not in (None, "openai"):
         cmd = [*cmd, "-c", f'model_provider="{usage["provider"]}"']
-    herdr(settings, "pane", "run", pane, f"DAWG_THREAD={tid} " + shlex.join(cmd))
-    wait_ready(settings, pane, 60, kind)
-    herdr(settings, "agent", "rename", pane, name, timeout=10)
-    update_thread(tid, lambda m: m["herdr"].update(agent=name))
-    herdr(settings, "agent", "prompt", pane, prompt, timeout=15)
+    launching.add(tid)
+    try:
+        herdr(settings, "pane", "run", pane, f"DAWG_THREAD={tid} " + shlex.join(cmd))
+        wait_ready(settings, pane, 60, kind)
+        herdr(settings, "agent", "rename", pane, name, timeout=10)
+        update_thread(tid, lambda m: m["herdr"].update(agent=name))
+        herdr(settings, "agent", "prompt", pane, prompt, timeout=15)
+    finally:
+        launching.discard(tid)
 
 
 def restart_agent(settings, tid, model, effort):
@@ -861,6 +874,95 @@ def clear_agent(settings, tid):
         post(tid, {"kind": "system", "from": "system", "body": f"Couldn't clear the agent: {err}"})
 
 
+def trust_folder(kind, cwd):
+    """Mark cwd trusted for the agent kind, so it starts without asking in its terminal."""
+    cwd = str(Path(cwd).resolve())
+    if kind == "claude":
+        path = Path.home() / ".claude.json"
+        data = json.loads(path.read_text()) if path.exists() else {}
+        project = data.setdefault("projects", {}).setdefault(cwd, {
+            "allowedTools": [], "mcpContextUris": [], "mcpServers": {},
+            "enabledMcpjsonServers": [], "disabledMcpjsonServers": []})
+        if project.get("hasTrustDialogAccepted"):
+            return
+        project["hasTrustDialogAccepted"] = True
+        text = json.dumps(data, indent=2)
+    else:
+        path = Path.home() / ".codex" / "config.toml"
+        text = path.read_text() if path.exists() else ""
+        if cwd in tomllib.loads(text).get("projects", {}):  # leave a level the user chose alone
+            return
+        text += ("\n" if text and not text.endswith("\n") else "") + \
+                f'\n[projects.{json.dumps(cwd)}]\ntrust_level = "trusted"\n'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".dawg-tmp")
+    tmp.write_text(text)
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+# Threads whose agent dawgd is starting, which mustn't be typed into until it has its first prompt.
+launching = set()
+deliver_lock = threading.Lock()
+
+
+def inbox_wait_path(tid):
+    return THREADS_DIR / f"{tid}.wait"
+
+
+def inbox_waiting(tid):
+    """Whether a `dawg inbox -w` is waiting for this thread's messages."""
+    try:
+        os.kill(int(inbox_wait_path(tid).read_text()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def inbox_prompt(kind, tid, text):
+    """A message from the inbox, typed into the agent's terminal."""
+    skill = "/dawg" if kind == "claude" else "the dawg skill ($dawg)"
+    return (f"[dawg inbox · thread {tid}] The user sent this from the dawg inbox, not the "
+            f"terminal: stay in away mode (enter it with {skill} if you aren't in it) and reply "
+            f"through dawg.\n\n{text}")
+
+
+def deliver(settings, tid):
+    """Type the user's queued messages into the thread's herdr agent.
+
+    Only when the agent sits idle and nothing is waiting on `dawg inbox -w`,
+    which would pick them up itself. An agent that's working gets them once
+    it's idle again, unless it read them with `dawg inbox` first.
+    """
+    with deliver_lock:
+        meta = load_thread(tid)
+        if not meta or tid in launching or inbox_waiting(tid):
+            return False
+        kind, h = thread_agent(meta).get("kind"), meta.get("herdr") or {}
+        msgs = [x for x in read_log(tid, meta["delivered"])
+                if x["from"] == "user" and x["kind"] == "text"]
+        if not msgs or kind not in AGENT_KINDS or not h.get("pane"):
+            return False
+        live = herdr_agents(settings).get(herdr_target(meta))
+        if not live or live.get("agent_status") not in ("idle", "done"):
+            return False
+        try:
+            herdr(settings, "agent", "prompt", herdr_target(meta),
+                  inbox_prompt(kind, tid, "\n\n".join(m["body"] for m in msgs)), timeout=15)
+        except HerdrError:
+            return False
+        seq = msgs[-1]["seq"]
+        update_thread(tid, lambda m: m.update(delivered=max(m["delivered"], seq)))
+        herdr_cache["at"] = 0  # it's working now; don't type the next message in on stale state
+        return True
+
+
+def deliver_all(settings):
+    for p in THREADS_DIR.glob("*.json"):
+        if (meta := json.loads(p.read_text())).get("herdr") and not meta.get("archived"):
+            deliver(settings, meta["id"])
+
+
 def agent_prompt(kind, tid, task=None):
     """The first prompt for an agent started from the inbox; no task means it was cleared."""
     if task:
@@ -875,7 +977,25 @@ def agent_prompt(kind, tid, task=None):
     return f"Use the dawg skill ($dawg). {intro}"
 
 
-def start_agent(settings, tid, cwd, kind, task, model="", effort=""):
+def prompt_when_ready(settings, pane, kind, prompt, note):
+    """Give a starting agent its first prompt once it's past any dialogs in its terminal."""
+    deadline, noted = time.time() + 3600, False
+    while True:
+        try:
+            wait_ready(settings, pane, max(deadline - time.time(), 0), kind)
+            return herdr(settings, "agent", "prompt", pane, prompt, timeout=15)
+        except HerdrError as err:
+            # It went idle, then showed another dialog before the prompt went in.
+            if err.code != "agent_blocked":
+                raise
+        if not noted:
+            note("The agent is waiting at a prompt in its terminal. Open Terminal to answer it; "
+                 "the task goes in once it's ready.")
+            noted = True
+        time.sleep(1)
+
+
+def start_agent(settings, tid, cwd, kind, task, model="", effort="", trust=False):
     """Open a herdr workspace for the thread and start the agent in it."""
     meta = load_thread(tid)
     name = meta["herdr"]["agent"]
@@ -883,6 +1003,12 @@ def start_agent(settings, tid, cwd, kind, task, model="", effort=""):
     def note(body):
         post(tid, {"kind": "system", "from": "system", "body": body})
 
+    if trust:
+        try:
+            trust_folder(kind, cwd)
+        except (OSError, ValueError, tomllib.TOMLDecodeError) as err:
+            note(f"Couldn't mark the folder trusted, so the agent may ask in its terminal: {err}")
+    launching.add(tid)
     try:
         out = herdr(settings, "workspace", "create", "--cwd", cwd, "--label", meta["title"],
                     "--env", f"DAWG_THREAD={tid}", "--no-focus")["result"]
@@ -900,12 +1026,13 @@ def start_agent(settings, tid, cwd, kind, task, model="", effort=""):
                 raise
             note("The agent is waiting at a prompt in its terminal, such as whether to trust "
                  "this folder. Open Terminal to answer it; the task goes in once it's ready.")
-            wait_ready(settings, pane, 900, kind)
-        herdr(settings, "agent", "prompt", pane, agent_prompt(kind, tid, task))
+        prompt_when_ready(settings, pane, kind, agent_prompt(kind, tid, task), note)
         note(f"Started {kind} as {name} in herdr workspace {wid}.")
     except (HerdrError, KeyError, TypeError) as err:
         note(f"Couldn't start the agent: {err}")
         update_thread(tid, lambda m: m.update(status="idle"))
+    finally:
+        launching.discard(tid)
 
 # ---------------------------------------------------------------- web
 
@@ -1148,6 +1275,7 @@ class Handler(BaseHTTPRequestHandler):
                                                        "text": text, "result": None}])
                             return self.send_json({"answered": rid})
             post(tid, {"kind": "text", "from": "user", "body": text})
+            threading.Thread(target=deliver, args=(settings, tid), daemon=True).start()
             return self.send_json({"queued": True})
         if name == "answer":
             rid = str(data.get("rid", ""))
@@ -1198,7 +1326,8 @@ class Handler(BaseHTTPRequestHandler):
         post(tid, {"kind": "text", "from": "user", "body": task}, lambda m: m.update(
             status="busy", delivered=m["seq"]))
         threading.Thread(target=start_agent, args=(self.server.settings, tid, str(cwd), kind, task,
-                                                   model, effort), daemon=True).start()
+                                                   model, effort, bool(data.get("trust"))),
+                         daemon=True).start()
         self.send_json({"thread": tid})
 
     def api_herdr(self, meta, data):
@@ -1376,6 +1505,7 @@ def serve(_args):
     srv.settings = settings
     srv.token = get_token()
     threading.Thread(target=poll_loop, args=(settings,), daemon=True).start()
+    threading.Thread(target=deliver_loop, args=(settings,), daemon=True).start()
     print(f"dawgd listening on {settings['bind']}:{settings['port']}", file=sys.stderr, flush=True)
     if settings["base_url"]:
         print(f"inbox: {settings['base_url']}/m/<token>  (token in {TOKEN_FILE})", file=sys.stderr, flush=True)
@@ -1537,14 +1667,21 @@ def status_cmd(args):
 def inbox_cmd(args):
     meta = thread_for(args)
     deadline = time.time() + args.expires
-    while True:
-        msgs = take_queued(meta["id"])
-        if msgs or not args.wait:
-            break
-        if time.time() > deadline:
-            print("dawg inbox: nothing arrived before the wait expired", file=sys.stderr)
-            return 3
-        time.sleep(1)
+    if args.wait:  # so dawgd leaves messages for it instead of typing them into the agent
+        inbox_wait_path(meta["id"]).write_text(str(os.getpid()))
+    try:
+        while True:
+            msgs = take_queued(meta["id"])
+            if msgs or not args.wait:
+                break
+            if time.time() > deadline:
+                print("dawg inbox: nothing arrived before the wait expired", file=sys.stderr)
+                return 3
+            time.sleep(1)
+    finally:
+        with contextlib.suppress(OSError):
+            if args.wait and inbox_wait_path(meta["id"]).read_text() == str(os.getpid()):
+                inbox_wait_path(meta["id"]).unlink()
     if args.json:
         print(json.dumps({"messages": [{"text": m["body"], "sent_at": m["ts"]} for m in msgs]}))
     else:

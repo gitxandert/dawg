@@ -127,6 +127,8 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-w
       <div style="flex:1"><label for="nModel">Model</label><input id="nModel" list="nModels" placeholder="default"><datalist id="nModels"></datalist></div>
       <div style="flex:1"><label for="nEffort">Effort</label><select id="nEffort"></select></div>
     </div>
+    <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="nTrust" checked style="width:auto">
+      Trust this folder, so the agent doesn't ask in its terminal</label>
     <label for="nTitle">Thread title (optional)</label>
     <input id="nTitle" placeholder="defaults to the directory name">
     <label for="nTask">Task</label>
@@ -537,7 +539,7 @@ $("#newForm").addEventListener("submit", async e => {
   e.preventDefault();
   $("#nGo").disabled = true; $("#nErr").textContent = "";
   try {
-    const r = await api("start", {cwd: $("#nCwd").value, kind: $("#nKind").value, model: $("#nModel").value, effort: $("#nEffort").value, title: $("#nTitle").value, task: $("#nTask").value});
+    const r = await api("start", {cwd: $("#nCwd").value, kind: $("#nKind").value, model: $("#nModel").value, effort: $("#nEffort").value, trust: $("#nTrust").checked, title: $("#nTitle").value, task: $("#nTask").value});
     $("#newDlg").close(); $("#nTask").value = ""; $("#nTitle").value = "";
     select(r.thread);
   } catch (err) { $("#nErr").textContent = err.message; }

@@ -56,6 +56,11 @@ lands in the shared Notifications thread instead of yours.
   Between steps, run `dawg inbox -T <id>`. It prints queued messages (nothing
   if there are none). Treat them as user instructions. `dawg status` and
   `dawg -T` also tell you on stderr when messages are waiting.
+- **Typed-in messages:** for an agent in herdr, dawgd types inbox messages
+  into its terminal when it's idle and no `dawg inbox -w` is waiting. They
+  start with `[dawg inbox · thread <id>]`. They come from the phone, not the
+  terminal: stay in away mode, or enter it on that thread if you weren't in
+  it, and answer through dawg.
 - **Muted threads:** the user can turn off texts for a thread. Asks and
   messages still reach the inbox and work the same; `dawg ask` just notes on
   stderr that no text went out.
@@ -87,7 +92,8 @@ locked while the user is active over SSH.
   the terminal. When the user approves a plan by phone, finish everything
   plan mode allows. Then ask for approval and send an ask saying the approval
   is waiting in the terminal.
-- **Exit** when any new message arrives in the terminal: the user is back.
+- **Exit** when any new message arrives in the terminal, except one that
+  starts with `[dawg inbox`: the user is back.
   Stop the pending background `dawg ask` or `dawg inbox -w` (TaskStop), set
   your status to `idle`, say in the terminal that away mode is off, and
   handle any open question there. A phone reply like
