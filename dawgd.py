@@ -769,6 +769,43 @@ def herdr_target(meta):
     return h.get("pane") or h["agent"]
 
 
+def stop_agent(settings, meta):
+    """Exit the thread's herdr agent and close its open asks."""
+    kind, pane = thread_agent(meta)["kind"], meta["herdr"]["pane"]
+    herdr(settings, "agent", "prompt", herdr_target(meta),
+          "/exit" if kind == "claude" else "/quit", timeout=15)
+    deadline = time.time() + 30
+    while live := [a for a in herdr(settings, "agent", "list", timeout=5)["result"]["agents"]
+                   if a.get("pane_id") == pane]:
+        if time.time() > deadline:
+            raise HerdrError("the agent didn't exit")
+        # Claude Code asks before stopping background work, with "Exit and stop tasks" first.
+        if live[0]["agent_status"] == "blocked" and "Exit and stop tasks" in str(
+                herdr(settings, "agent", "read", pane, "--source", "visible", timeout=10)):
+            herdr(settings, "agent", "send-keys", pane, "enter", timeout=10)
+        time.sleep(1)
+    # Its background commands died with it, so nobody would read answers to open asks.
+    with answer_lock:
+        for rid in meta["open_asks"]:
+            if (req := load_request(rid)) and ask_open(rid):
+                write_json(req_path(rid), {**req, "expires": time.time()})
+    update_thread(meta["id"], lambda m: m.update(open_asks=[]))
+
+
+def launch_agent(settings, meta, cmd, prompt):
+    """Run cmd in the thread's pane once its agent has exited, then give it prompt."""
+    tid, kind = meta["id"], thread_agent(meta)["kind"]
+    pane, name = meta["herdr"]["pane"], meta["herdr"].get("agent") or f"dawg-{tid}"
+    usage = meta.get("usage") or {}
+    if kind == "codex" and usage.get("provider") not in (None, "openai"):
+        cmd = [*cmd, "-c", f'model_provider="{usage["provider"]}"']
+    herdr(settings, "pane", "run", pane, f"DAWG_THREAD={tid} " + shlex.join(cmd))
+    wait_ready(settings, pane, 60, kind)
+    herdr(settings, "agent", "rename", pane, name, timeout=10)
+    update_thread(tid, lambda m: m["herdr"].update(agent=name))
+    herdr(settings, "agent", "prompt", pane, prompt, timeout=15)
+
+
 def restart_agent(settings, tid, model, effort):
     """Restart an agent on the same conversation with new model settings.
 
@@ -776,9 +813,7 @@ def restart_agent(settings, tid, model, effort):
     for new sessions; flags on a resumed session change only this one.
     """
     meta = load_thread(tid)
-    h, usage = meta["herdr"], meta["usage"]
-    kind, sid = thread_agent(meta)["kind"], usage["session_id"]
-    pane, name = h["pane"], h.get("agent") or f"dawg-{tid}"
+    kind, sid = thread_agent(meta)["kind"], meta["usage"]["session_id"]
 
     def note(body):
         post(tid, {"kind": "system", "from": "system", "body": body})
@@ -786,51 +821,58 @@ def restart_agent(settings, tid, model, effort):
     label = " · ".join(x for x in (model or "default model", effort and f"{effort} effort") if x)
     note(f"Restarting on {label}…")
     try:
-        herdr(settings, "agent", "prompt", herdr_target(meta),
-              "/exit" if kind == "claude" else "/quit", timeout=15)
-        deadline = time.time() + 30
-        while live := [a for a in herdr(settings, "agent", "list", timeout=5)["result"]["agents"]
-                       if a.get("pane_id") == pane]:
-            if time.time() > deadline:
-                raise HerdrError("the agent didn't exit")
-            # Claude Code asks before stopping background work, with "Exit and stop tasks" first.
-            if live[0]["agent_status"] == "blocked" and "Exit and stop tasks" in str(
-                    herdr(settings, "agent", "read", pane, "--source", "visible", timeout=10)):
-                herdr(settings, "agent", "send-keys", pane, "enter", timeout=10)
-            time.sleep(1)
-        # Its background commands died with it, so nobody would read answers to open asks.
-        with answer_lock:
-            for rid in meta["open_asks"]:
-                if (req := load_request(rid)) and ask_open(rid):
-                    write_json(req_path(rid), {**req, "expires": time.time()})
-        update_thread(tid, lambda m: m.update(open_asks=[]))
-        if kind == "claude":
-            cmd = ["claude", "--resume", sid]
-        else:
-            cmd = ["codex", "resume", sid]
-            if usage.get("provider") not in (None, "openai"):
-                cmd += ["-c", f'model_provider="{usage["provider"]}"']
-        cmd += agent_flags(kind, model, effort)
-        herdr(settings, "pane", "run", pane, f"DAWG_THREAD={tid} " + shlex.join(cmd))
-        wait_ready(settings, pane, 60, kind)
-        herdr(settings, "agent", "rename", pane, name, timeout=10)
-        update_thread(tid, lambda m: m["herdr"].update(agent=name))
-        herdr(settings, "agent", "prompt", pane,
-              f"dawg inbox: this session was restarted to switch to {label}. Background "
-              f"commands such as a pending dawg ask or dawg inbox -w were stopped, and open "
-              f"questions in your thread ({tid}) were closed. Carry on with your task, and "
-              f"re-send anything you still need answered.", timeout=15)
+        stop_agent(settings, meta)
+        cmd = ["claude", "--resume", sid] if kind == "claude" else ["codex", "resume", sid]
+        launch_agent(settings, meta, cmd + agent_flags(kind, model, effort),
+                     f"dawg inbox: this session was restarted to switch to {label}. Background "
+                     f"commands such as a pending dawg ask or dawg inbox -w were stopped, and open "
+                     f"questions in your thread ({tid}) were closed. Carry on with your task, and "
+                     f"re-send anything you still need answered.")
         note(f"Restarted on {label}.")
     except (HerdrError, KeyError, TypeError) as err:
         note(f"Couldn't restart the agent: {err}")
 
 
-def agent_prompt(kind, tid, task):
-    intro = (f"You were started from the dawg inbox. Your dawg thread is {tid} "
-             f"(DAWG_THREAD is set). Go straight into away mode.")
+def clear_agent(settings, tid):
+    """Start the thread's agent over with an empty context, as /clear would.
+
+    It exits and starts a new session instead of typing /clear, because
+    exiting also stops its background commands (a pending dawg ask or
+    dawg inbox -w), which would otherwise report into the new conversation.
+    The thread keeps its messages, its id and the agent's model settings.
+    """
+    meta = load_thread(tid)
+    kind, usage = thread_agent(meta)["kind"], meta.get("usage") or {}
+    model = usage.get("model_id") if kind == "claude" else usage.get("model")
+    effort = usage.get("effort") or ""
+
+    post(tid, {"kind": "system", "from": "system", "body": "Clearing the agent's context…"})
+    try:
+        stop_agent(settings, meta)
+        # Messages queued for the old conversation aren't the new one's to act on.
+        kept = {k: usage[k] for k in ("service", "kind", "model", "model_id", "effort", "provider")
+                if k in usage}
+        post(tid, {"kind": "clear", "from": "system", "body": "Context cleared"},
+             lambda m: m.update(delivered=m["seq"], status="idle",
+                                usage={**kept, "context_pct": 0, "at": time.time()}))
+        launch_agent(settings, meta, [kind, *agent_flags(kind, model or "", effort)],
+                     agent_prompt(kind, tid))
+    except (HerdrError, KeyError, TypeError) as err:
+        post(tid, {"kind": "system", "from": "system", "body": f"Couldn't clear the agent: {err}"})
+
+
+def agent_prompt(kind, tid, task=None):
+    """The first prompt for an agent started from the inbox; no task means it was cleared."""
+    if task:
+        intro = (f"You were started from the dawg inbox. Your dawg thread is {tid} "
+                 f"(DAWG_THREAD is set). Go straight into away mode.\n\nTask: {task}")
+    else:
+        intro = (f"Your context was cleared from the dawg inbox. Your dawg thread is {tid} "
+                 f"(DAWG_THREAD is set); its earlier messages belong to the old conversation. "
+                 f"Go straight into away mode and ask what to work on.")
     if kind == "claude":
-        return f"/dawg {intro}\n\nTask: {task}"
-    return f"Use the dawg skill ($dawg). {intro}\n\nTask: {task}"
+        return f"/dawg {intro}"
+    return f"Use the dawg skill ($dawg). {intro}"
 
 
 def start_agent(settings, tid, cwd, kind, task, model="", effort=""):
@@ -1196,6 +1238,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not live or live["agent_status"] not in ("idle", "done"):
                     return self.send_json({"error": "Wait until the agent is idle in herdr."}, 409)
                 threading.Thread(target=restart_agent, args=(settings, meta["id"], model, effort),
+                                 daemon=True).start()
+                return self.send_json({"ok": True})
+            if op == "clear":
+                if thread_agent(meta).get("kind") not in AGENT_KINDS:
+                    return self.send_json({"error": "Only Claude and Codex agents can be cleared."}, 400)
+                live = herdr_agents(settings).get(herdr_target(meta))
+                if not live or live["agent_status"] not in ("idle", "done"):
+                    return self.send_json({"error": "Wait until the agent is idle in herdr."}, 409)
+                threading.Thread(target=clear_agent, args=(settings, meta["id"]),
                                  daemon=True).start()
                 return self.send_json({"ok": True})
             if op == "close":

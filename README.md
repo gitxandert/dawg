@@ -97,6 +97,17 @@ and it goes straight into away mode. For those agents the thread also shows
 herdr's view of the agent, a **Terminal** to read its screen and press keys
 (for permission prompts), and **Close** to end its workspace.
 
+**Clear** starts a Claude or Codex agent in herdr over with an empty
+context, as `/clear` would, while it's idle. It exits the agent and starts a
+new session in the same pane, with the same thread, model and effort, so
+its background commands (a pending `dawg ask` or `dawg inbox -w`) stop too
+and can't report into the new conversation. The thread keeps its messages,
+with a divider where the context was cleared; open questions close, and
+messages still queued for the old conversation aren't delivered to the new
+one. The new agent goes straight into away mode and asks what to work on.
+Agents in a plain terminal have no Clear, since dawg can't type into their
+terminal.
+
 ### Models and usage
 
 The inbox groups threads by service: Claude, Codex, a local model provider

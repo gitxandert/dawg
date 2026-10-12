@@ -39,6 +39,10 @@ At the start of away mode:
 - If `$DAWG_THREAD` is set (you were started from the inbox), use it.
 - Otherwise run `dawg thread new -t "<project>"` once and keep the id it
   prints for the rest of the session.
+- A new thread doesn't clear your context. If the user asks you to clear
+  your thread or start fresh, keep your thread and tell them: **Clear** in
+  the inbox does it for an agent running in herdr, and in a plain terminal
+  they type `/clear` there.
 
 Pass `-T <id>` on every `dawg` call: `dawg -T`, `dawg ask -T`,
 `dawg status -T`, `dawg inbox -T`. The Bash tool doesn't keep exported

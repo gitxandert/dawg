@@ -64,6 +64,8 @@ body{display:flex;flex-direction:column;height:100dvh}
 .msg.user{align-self:flex-end;background:var(--accent);color:var(--accent-fg);border-bottom-right-radius:5px}
 .meta{font-size:11px;color:var(--muted);margin-top:2px}
 .msg.user .meta{color:rgba(255,255,255,.75);text-align:right}
+.divider{align-self:stretch;display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;margin:8px 0}
+.divider::before,.divider::after{content:"";flex:1;border-top:1px solid var(--muted);opacity:.4}
 .sys{align-self:center;color:var(--muted);font-size:12px;text-align:center;max-width:90%}
 .ask.flash{animation:flash 1.2s 2}
 @keyframes flash{50%{box-shadow:0 0 0 3px var(--accent)}}
@@ -362,6 +364,7 @@ function renderHead(t) {
     h ? el("span", {class: "pill", title: `herdr agent ${h.agent}`}, `herdr: ${live}`) : null,
     h && h.workspace && !scoped ? btn("Terminal", openTerm) : null,
     h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? btn("Settings", openSettings, "Change this agent's model and effort") : null,
+    h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? btn("Clear", clearAgent, "Start the agent over with an empty context, like /clear; the messages stay") : null,
     btn(t.muted ? "🔕 Texts off" : "🔔 Texts on", () => api("thread", {thread: t.id, muted: !t.muted}).then(refresh),
         "Turn phone texts for this thread on or off; the inbox still updates"),
     btn(t.archived ? "Unarchive" : "Archive", () => api("thread", {thread: t.id, archived: !t.archived}).then(refresh)),
@@ -380,6 +383,7 @@ function renderEntry(x, t) {
     return el("div", {class: "sys"}, el("span", {class: `dot ${x.status}`, style: "display:inline-block;margin:0 4px 0 0;width:7px;height:7px"}),
               `${x.status}${x.note ? " · " + x.note : ""} · ${clock(x.ts)}`);
   }
+  if (x.kind === "clear") return el("div", {class: "divider"}, `${x.body} · ${clock(x.ts)}`);
   if (x.kind === "system") return el("div", {class: "sys"}, `${x.body} · ${clock(x.ts)}`);
   if (x.kind === "result") {
     const r = x.result;
@@ -508,6 +512,12 @@ $("#setForm").addEventListener("submit", async e => {
   } catch (err) { $("#sErr").textContent = err.message; }
   $("#sGo").disabled = false;
 });
+
+async function clearAgent() {
+  if (!confirm("Clear this agent's context? It starts over in a new session, as with /clear, and stops its background commands. The messages stay here.")) return;
+  try { await api("herdr", {thread: sel, op: "clear"}); await refresh(); }
+  catch (e) { alert(e.message); }
+}
 
 async function closeAgent() {
   if (!confirm("Close this agent's herdr workspace? The agent stops; the thread stays here.")) return;
