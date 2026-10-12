@@ -56,6 +56,7 @@ SETTINGS_FILE = CONFIG_DIR / "dawgd.toml"
 TOKEN_FILE = CONFIG_DIR / "token"
 THREADS_DIR = STATE_DIR / "threads"
 INBOX_PAGE = Path(__file__).with_name("inbox.html")
+ICON = Path(__file__).with_name("icon.png")
 DAWG = shutil.which("dawg") or str(Path(__file__).with_name("dawg"))
 HERDR = shutil.which("herdr")
 
@@ -571,6 +572,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in urlsplit(self.path).path.split("/") if p]
         if len(parts) == 2 and parts[0] == "r":
             return "request", parts[1], None
+        if parts == ["icon.png"]:  # the home-screen icon; nothing secret
+            return "icon", None, None
         if parts[:1] == ["i"] and len(parts) in (2, 4) and (meta := thread_by_key(parts[1])):
             if len(parts) == 2:
                 return "link", None, meta["id"]
@@ -600,6 +603,8 @@ class Handler(BaseHTTPRequestHandler):
         kind, arg, scope = self.route()
         if kind == "request":
             self.show_request(arg)
+        elif kind == "icon":
+            self.send_file(ICON, "image/png")
         elif kind == "standing":
             self.show_standing()
         elif kind == "inbox":

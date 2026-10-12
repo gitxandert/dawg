@@ -76,8 +76,9 @@ can:
   otherwise it queues until the agent runs `dawg inbox`;
 - turn its texts off or on, and archive it.
 
-Keep the inbox open in one tab, or add it to your home screen: it updates
-live. By default, tapping a text does nothing, because Bark opens every
+Keep the inbox open in one tab, or add it to your home screen (in Safari or
+Brave: Share, then Add to Home Screen), where it opens full screen as its
+own app. It updates live. By default, tapping a text does nothing, because Bark opens every
 link in a new browser tab. To have texts open the inbox instead, set `tap`
 in `dawgd.toml`:
 
