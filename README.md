@@ -97,6 +97,36 @@ and it goes straight into away mode. For those agents the thread also shows
 herdr's view of the agent, a **Terminal** to read its screen and press keys
 (for permission prompts), and **Close** to end its workspace.
 
+### Models and usage
+
+The inbox groups threads by service: Claude, Codex, a local model provider
+such as Ollama, or Other. Each Claude and Codex group shows that account's
+5-hour and weekly limits, as % used or % left (toggle it in the group);
+local models have no limits to show. Each thread shows its agent's model,
+effort and context use, plus session cost for Claude.
+
+- Claude Code reports through its status line: `install.sh` makes
+  `dawg statusline` the status line, unless you already have one.
+- Codex agents are read from their session logs in `~/.codex/sessions`,
+  once they've run a dawg command (that's how dawg knows which Codex is
+  whose).
+
+When a limit passes 80% or 95% you get a text, and a note in the
+Notifications thread. Set the levels with `usage_alerts = [80, 95]` in
+`dawgd.toml`.
+
+For a Claude or Codex agent running in herdr (started from the inbox, or
+started in a herdr pane and using its thread), **Settings** changes its
+model and effort. dawg restarts it on the same conversation (`claude
+--resume` or `codex resume`) with the new settings, so the change applies
+to that agent only and doesn't touch your defaults the way `/model` would.
+It stops whatever the agent was running in the background, closes its open
+questions, and tells it to re-ask. Agents in a plain terminal show their
+settings, but dawg can't type into their terminal to change them. **New
+agent** also takes a model and effort. If a new agent stops at a startup
+prompt (trusting the folder, an update notice), the thread says so; answer
+it from **Terminal** and the task goes in once it's ready.
+
 To use the skill, tell the agent you're stepping away, or run `/dawg`. It
 texts you its questions until you type in the terminal again. When it finishes
 a task, it asks what to do next and suggests next steps.

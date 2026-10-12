@@ -9,6 +9,7 @@
 #   dawg status -T ID busy|blocked|idle [NOTE]   set a thread's inbox status
 #   dawg inbox -T ID [-w]             print messages queued from the inbox
 #   dawg thread new -t TITLE          start an inbox thread; prints its id
+#   dawg statusline                   Claude Code status line; reports usage to the inbox
 #
 # Options:
 #   -T THREAD   inbox thread to post to (default: $DAWG_THREAD, else the
@@ -29,7 +30,7 @@ set -u
 
 dawgd="$(dirname "$(readlink -f "$0")")/dawgd.py"
 case "${1:-}" in
-  ask|status|inbox|thread) exec python3 "$dawgd" "$@" ;;
+  ask|status|inbox|thread|statusline) exec python3 "$dawgd" "$@" ;;
 esac
 
 server="${DAWG_SERVER:-https://api.day.app}"

@@ -9,6 +9,7 @@ Subcommands:
   dawgd.py status -T ID STATUS [NOTE] set a thread's status: busy, blocked, idle
   dawgd.py inbox -T ID [-w]          print messages queued for a thread
   dawgd.py thread new -t TITLE       start a thread; prints its id
+  dawgd.py statusline                Claude Code status line: reports model and usage
 
 A request is a notification whose tap opens a page with one button per
 option. A request with several questions shows them one at a time, then
@@ -39,6 +40,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,6 +57,7 @@ ACTIONS_FILE = CONFIG_DIR / "actions.toml"
 SETTINGS_FILE = CONFIG_DIR / "dawgd.toml"
 TOKEN_FILE = CONFIG_DIR / "token"
 THREADS_DIR = STATE_DIR / "threads"
+USAGE_FILE = STATE_DIR / "usage.json"
 INBOX_PAGE = Path(__file__).with_name("inbox.html")
 ICON = Path(__file__).with_name("icon.png")
 DAWG = shutil.which("dawg") or str(Path(__file__).with_name("dawg"))
@@ -82,6 +85,7 @@ DEFAULT_SETTINGS = {
     # What tapping a text opens. Bark hands every link to the browser as a new
     # tab, so by default a tap does nothing and the inbox stays the one tab.
     "tap": "none",  # or "questions": asks link to the inbox; "all": every text does
+    "usage_alerts": [80, 95],  # text when a 5-hour or weekly limit passes these percentages
 }
 
 answer_lock = threading.Lock()
@@ -418,10 +422,295 @@ def queued_count(tid):
 
 
 
+# ---------------------------------------------------------------- usage
+#
+# Usage is grouped by service, the provider an agent's model comes from.
+# Claude Code reports through `dawg statusline`; Codex writes the same facts
+# to its session log, which dawgd reads. A service's limits are account-wide,
+# so the inbox shows one set per service. Each report lands on the thread of
+# the agent it came from: the one named by DAWG_THREAD, or the thread whose
+# dawg commands ran under the same agent process.
+
+CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
+# Model and effort choices per agent kind; "" keeps the user's default.
+# Codex takes any model name; the inbox suggests ones it has seen.
+CHOICES = {
+    "claude": {"models": ["fable", "opus", "sonnet", "haiku"],
+               "efforts": ["low", "medium", "high", "xhigh", "max"]},
+    "codex": {"models": [], "efforts": ["minimal", "low", "medium", "high", "xhigh"]},
+}
+SERVICE_NAMES = {"claude": "Claude", "codex": "Codex", "ollama": "Ollama (local)",
+                 "lmstudio": "LM Studio (local)", "other": "Other"}
+
+
+def agent_process():
+    """(kind, 'pid:starttime') of the nearest Claude Code or Codex ancestor, or (None, None)."""
+    pid = os.getppid()
+    for _ in range(16):
+        if pid <= 1:
+            break
+        try:
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            break
+        if comm in AGENT_KINDS:
+            return comm, f"{pid}:{fields[19]}"
+        pid = int(fields[1])
+    return None, None
+
+
+def proc_alive(proc):
+    pid, start = proc.split(":")
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19] == start
+    except (OSError, IndexError):
+        return False
+
+
+def thread_agent(meta):
+    """{"kind", "proc"} for the agent behind a thread, as far as it's known."""
+    agent = dict(meta.get("agent") or {})
+    if meta.get("claude") and not agent:  # threads from before Codex support
+        agent = {"kind": "claude", "proc": meta["claude"]}
+    agent.setdefault("kind", (meta.get("herdr") or {}).get("kind"))
+    return agent
+
+
+def thread_service(meta):
+    return (meta.get("usage") or {}).get("service") or thread_agent(meta).get("kind") or "other"
+
+
+def thread_for_process(proc):
+    if not proc:
+        return None
+    for p in THREADS_DIR.glob("*.json"):
+        meta = json.loads(p.read_text())
+        if thread_agent(meta).get("proc") == proc:
+            return meta
+    return None
+
+
+def load_usage():
+    try:
+        return json.loads(USAGE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def window_label(minutes):
+    return {300: "5 hours", 10080: "Week"}.get(minutes) or (
+        f"{minutes // 1440} days" if minutes % 1440 == 0 else f"{minutes / 60:g} hours")
+
+
+def claude_windows(limits):
+    out = []
+    for key, label in (("five_hour", "5 hours"), ("seven_day", "Week"), ("spend_limit", "Spend")):
+        w = limits.get(key)
+        if isinstance(w, dict) and w.get("used_percentage") is not None:
+            out.append({"key": key, "label": label, "used": w["used_percentage"],
+                        "resets_at": w.get("resets_at")})
+    return out
+
+
+def codex_windows(limits):
+    out = []
+    for key in ("primary", "secondary"):
+        w = limits.get(key)
+        if isinstance(w, dict) and w.get("used_percent") is not None:
+            out.append({"key": key, "label": window_label(w.get("window_minutes") or 0),
+                        "used": w["used_percent"], "resets_at": w.get("resets_at")})
+    return out
+
+
+def check_alerts(usage, service, windows, settings):
+    """Alert texts for windows that passed their next level, once per window period."""
+    alerts = []
+    alerted = usage.setdefault("alerted", {})
+    name = SERVICE_NAMES.get(service, service)
+    for w in windows:
+        key = f"{service}:{w['key']}"
+        prev = alerted.get(key, {})
+        level = prev.get("level", 0) if prev.get("resets_at") == w["resets_at"] else 0
+        passed = max((t for t in settings["usage_alerts"] if w["used"] >= t), default=0)
+        if passed > level:
+            when = (time.strftime("%a %H:%M", time.localtime(w["resets_at"]))
+                    if w["resets_at"] else "later")
+            span = {"5 hours": "5-hour", "Week": "weekly"}.get(w["label"], w["label"].lower())
+            alerts.append(f"{name} {span} limit at {w['used']:.0f}% (resets {when})")
+        alerted[key] = {"resets_at": w["resets_at"], "level": max(passed, level)}
+    return alerts
+
+
+def save_service_usage(service, windows, settings):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(STATE_DIR / "usage.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        usage = load_usage()
+        usage.pop("limits", None)  # the single-service layout from before
+        alerts = check_alerts(usage, service, windows, settings)
+        usage.setdefault("services", {})[service] = {"windows": windows, "at": time.time()}
+        write_json(USAGE_FILE, usage)
+    for text in alerts:
+        # In the background: the status line shouldn't wait on the push server.
+        subprocess.Popen([sys.executable, __file__, "send", "-T", NOTIFICATIONS, "-t", "dawg usage",
+                          "-l", "timeSensitive", text], start_new_session=True,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def set_thread_usage(meta, report):
+    old = {k: v for k, v in (meta.get("usage") or {}).items() if k != "at"}
+    if old != report or time.time() - (meta.get("usage") or {}).get("at", 0) > 60:
+        update_thread(meta["id"], lambda m: m.update(usage={**report, "at": time.time()}))
+
+
+def report_usage(data, settings):
+    """Record a Claude Code status line report."""
+    tid = os.environ.get("DAWG_THREAD")
+    meta = load_thread(tid) if tid else thread_for_process(agent_process()[1])
+    if meta:
+        model = data.get("model") or {}
+        set_thread_usage(meta, {
+            "service": "claude", "kind": "claude",
+            "model": model.get("display_name"), "model_id": model.get("id"),
+            "effort": (data.get("effort") or {}).get("level"),
+            "context_pct": (data.get("context_window") or {}).get("used_percentage"),
+            "cost_usd": (data.get("cost") or {}).get("total_cost_usd"),
+            "session_id": data.get("session_id")})
+    windows = claude_windows(data.get("rate_limits") or {})
+    if windows:
+        save_service_usage("claude", windows, settings)
+
+
+def status_text(data):
+    parts = [(data.get("model") or {}).get("display_name"), (data.get("effort") or {}).get("level")]
+    ctx = (data.get("context_window") or {}).get("used_percentage")
+    if ctx is not None:
+        parts.append(f"ctx {ctx:.0f}%")
+    for w in claude_windows(data.get("rate_limits") or {}):
+        if w["key"] != "spend_limit":
+            parts.append(f"{'5h' if w['key'] == 'five_hour' else '7d'} {w['used']:.0f}%")
+    return " · ".join(p for p in parts if p)
+
+
+def codex_rollout(proc):
+    """The session log a running Codex process is writing."""
+    found = []
+    try:
+        for fd in Path(f"/proc/{proc.split(':')[0]}/fd").iterdir():
+            target = os.readlink(fd)
+            if target.startswith(str(CODEX_SESSIONS.resolve())) and Path(target).name.startswith("rollout-"):
+                found.append(Path(target))
+    except OSError:
+        pass
+    return max(found, key=lambda f: f.stat().st_mtime, default=None)
+
+
+def read_codex(path):
+    """Session id, provider, model, effort, context and limits from a Codex session log."""
+    out = {}
+    with open(path, "rb") as f:
+        head = json.loads(f.readline() or b"{}").get("payload") or {}
+        out.update(session_id=head.get("id"), provider=head.get("model_provider"))
+        f.seek(0, 2)
+        f.seek(max(0, f.tell() - 512 * 1024))
+        lines = f.read().decode(errors="replace").splitlines()
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        p = e.get("payload") or {}
+        if e.get("type") == "turn_context" and "model" not in out:
+            mode = (p.get("collaboration_mode") or {}).get("settings") or {}
+            out["model"] = p.get("model") or mode.get("model")
+            out["effort"] = p.get("effort") or mode.get("reasoning_effort")
+        if p.get("type") == "token_count" and "tokens" not in out:
+            info = p.get("info") or {}
+            last, window = info.get("last_token_usage") or {}, info.get("model_context_window")
+            out["tokens"] = True
+            if window and last.get("input_tokens") is not None:
+                out["context_pct"] = round(100 * last["input_tokens"] / window)
+            if isinstance(p.get("rate_limits"), dict):
+                out["limits"] = p["rate_limits"]
+        if "model" in out and "tokens" in out:
+            break
+    return out
+
+
+codex_seen = {}
+
+
+def poll_codex(settings):
+    """Read the session logs of running Codex agents into their threads."""
+    for p in THREADS_DIR.glob("*.json"):
+        meta = json.loads(p.read_text())
+        agent = thread_agent(meta)
+        if agent.get("kind") != "codex" or not agent.get("proc") or not proc_alive(agent["proc"]):
+            continue
+        path = codex_rollout(agent["proc"])
+        if not path or codex_seen.get(meta["id"]) == (path, path.stat().st_mtime):
+            continue
+        codex_seen[meta["id"]] = (path, path.stat().st_mtime)
+        info = read_codex(path)
+        provider = info.get("provider") or "openai"
+        service = "codex" if provider == "openai" else provider
+        set_thread_usage(meta, {"service": service, "kind": "codex", "provider": provider,
+                                "model": info.get("model"), "model_id": info.get("model"),
+                                "effort": info.get("effort"), "context_pct": info.get("context_pct"),
+                                "cost_usd": None, "session_id": info.get("session_id")})
+        windows = codex_windows(info.get("limits") or {})
+        if windows and service == "codex":
+            save_service_usage("codex", windows, settings)
+
+
+def poll_loop(settings):
+    while True:
+        try:
+            poll_codex(settings)
+        except Exception as err:  # keep polling; a log can be mid-write
+            print(f"dawgd: reading Codex usage: {err}", file=sys.stderr, flush=True)
+        time.sleep(10)
+
+
+def model_suggestions():
+    """Models the inbox offers per agent kind: the fixed Claude aliases, and Codex models seen."""
+    seen = {m for p in THREADS_DIR.glob("*.json")
+            if (u := json.loads(p.read_text()).get("usage") or {}).get("kind") == "codex"
+            and (m := u.get("model"))}
+    try:
+        seen.add(tomllib.loads((Path.home() / ".codex" / "config.toml").read_text())["model"])
+    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        pass
+    return {"claude": CHOICES["claude"],
+            "codex": {"models": sorted(seen), "efforts": CHOICES["codex"]["efforts"]}}
+
+
+def check_choice(kind, model, effort):
+    """An error message if model or effort doesn't suit the agent kind."""
+    if kind not in CHOICES:
+        return "Only Claude and Codex agents have model settings."
+    if effort and effort not in CHOICES[kind]["efforts"]:
+        return "Unknown effort."
+    if model and (model not in CHOICES[kind]["models"] if kind == "claude"
+                  else not re.fullmatch(r"[A-Za-z0-9._:/-]{1,64}", model)):
+        return "Unknown model."
+    return None
+
+
+def agent_flags(kind, model, effort):
+    if kind == "claude":
+        return (["--model", model] if model else []) + (["--effort", effort] if effort else [])
+    return (["-m", model] if model else []) + \
+           (["-c", f'model_reasoning_effort="{effort}"'] if effort else [])
+
+
 # ---------------------------------------------------------------- herdr
 
 class HerdrError(Exception):
-    pass
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 herdr_cache = {"at": 0.0, "agents": {}}
@@ -439,10 +728,10 @@ def herdr(settings, *args, timeout=30):
         raise HerdrError(f"herdr {args[0]} {args[1]} timed out")
     if p.returncode != 0:
         try:
-            msg = json.loads(p.stderr or p.stdout)["error"]["message"]
+            error = json.loads(p.stderr or p.stdout)["error"]
+            raise HerdrError(error["message"], error.get("code"))
         except (ValueError, KeyError, TypeError):
-            msg = (p.stderr or p.stdout).strip() or f"exit {p.returncode}"
-        raise HerdrError(msg)
+            raise HerdrError((p.stderr or p.stdout).strip() or f"exit {p.returncode}")
     try:
         return json.loads(p.stdout)
     except ValueError:
@@ -455,11 +744,85 @@ def herdr_agents(settings):
         if time.time() - herdr_cache["at"] > 3:
             try:
                 out = herdr(settings, "agent", "list", timeout=5)
-                herdr_cache["agents"] = {a["name"]: a for a in out["result"]["agents"] if a.get("name")}
+                agents = out["result"]["agents"]
+                herdr_cache["agents"] = {**{a["pane_id"]: a for a in agents if a.get("pane_id")},
+                                         **{a["name"]: a for a in agents if a.get("name")}}
             except (HerdrError, KeyError, TypeError):
                 herdr_cache["agents"] = {}
             herdr_cache["at"] = time.time()
         return herdr_cache["agents"]
+
+
+def wait_ready(settings, pane, seconds, what):
+    """Wait until the agent in pane sits idle at its prompt."""
+    deadline = time.time() + seconds
+    while not any(a.get("pane_id") == pane and a.get("agent_status") in ("idle", "done")
+                  for a in herdr(settings, "agent", "list", timeout=5)["result"]["agents"]):
+        if time.time() > deadline:
+            raise HerdrError(f"{what} didn't become ready; check the terminal")
+        time.sleep(1)
+
+
+def herdr_target(meta):
+    """How herdr commands address this thread's agent: its pane, which outlives restarts."""
+    h = meta["herdr"]
+    return h.get("pane") or h["agent"]
+
+
+def restart_agent(settings, tid, model, effort):
+    """Restart an agent on the same conversation with new model settings.
+
+    Claude Code's /model and /effort would also change the user's defaults
+    for new sessions; flags on a resumed session change only this one.
+    """
+    meta = load_thread(tid)
+    h, usage = meta["herdr"], meta["usage"]
+    kind, sid = thread_agent(meta)["kind"], usage["session_id"]
+    pane, name = h["pane"], h.get("agent") or f"dawg-{tid}"
+
+    def note(body):
+        post(tid, {"kind": "system", "from": "system", "body": body})
+
+    label = " · ".join(x for x in (model or "default model", effort and f"{effort} effort") if x)
+    note(f"Restarting on {label}…")
+    try:
+        herdr(settings, "agent", "prompt", herdr_target(meta),
+              "/exit" if kind == "claude" else "/quit", timeout=15)
+        deadline = time.time() + 30
+        while live := [a for a in herdr(settings, "agent", "list", timeout=5)["result"]["agents"]
+                       if a.get("pane_id") == pane]:
+            if time.time() > deadline:
+                raise HerdrError("the agent didn't exit")
+            # Claude Code asks before stopping background work, with "Exit and stop tasks" first.
+            if live[0]["agent_status"] == "blocked" and "Exit and stop tasks" in str(
+                    herdr(settings, "agent", "read", pane, "--source", "visible", timeout=10)):
+                herdr(settings, "agent", "send-keys", pane, "enter", timeout=10)
+            time.sleep(1)
+        # Its background commands died with it, so nobody would read answers to open asks.
+        with answer_lock:
+            for rid in meta["open_asks"]:
+                if (req := load_request(rid)) and ask_open(rid):
+                    write_json(req_path(rid), {**req, "expires": time.time()})
+        update_thread(tid, lambda m: m.update(open_asks=[]))
+        if kind == "claude":
+            cmd = ["claude", "--resume", sid]
+        else:
+            cmd = ["codex", "resume", sid]
+            if usage.get("provider") not in (None, "openai"):
+                cmd += ["-c", f'model_provider="{usage["provider"]}"']
+        cmd += agent_flags(kind, model, effort)
+        herdr(settings, "pane", "run", pane, f"DAWG_THREAD={tid} " + shlex.join(cmd))
+        wait_ready(settings, pane, 60, kind)
+        herdr(settings, "agent", "rename", pane, name, timeout=10)
+        update_thread(tid, lambda m: m["herdr"].update(agent=name))
+        herdr(settings, "agent", "prompt", pane,
+              f"dawg inbox: this session was restarted to switch to {label}. Background "
+              f"commands such as a pending dawg ask or dawg inbox -w were stopped, and open "
+              f"questions in your thread ({tid}) were closed. Carry on with your task, and "
+              f"re-send anything you still need answered.", timeout=15)
+        note(f"Restarted on {label}.")
+    except (HerdrError, KeyError, TypeError) as err:
+        note(f"Couldn't restart the agent: {err}")
 
 
 def agent_prompt(kind, tid, task):
@@ -467,10 +830,10 @@ def agent_prompt(kind, tid, task):
              f"(DAWG_THREAD is set). Go straight into away mode.")
     if kind == "claude":
         return f"/dawg {intro}\n\nTask: {task}"
-    return f"Use the dawg skill. {intro}\n\nTask: {task}"
+    return f"Use the dawg skill ($dawg). {intro}\n\nTask: {task}"
 
 
-def start_agent(settings, tid, cwd, kind, task):
+def start_agent(settings, tid, cwd, kind, task, model="", effort=""):
     """Open a herdr workspace for the thread and start the agent in it."""
     meta = load_thread(tid)
     name = meta["herdr"]["agent"]
@@ -486,9 +849,17 @@ def start_agent(settings, tid, cwd, kind, task):
         def placed(m):
             m["herdr"].update(workspace=wid, pane=pane)
         update_thread(tid, placed)
-        herdr(settings, "agent", "start", name, "--kind", kind, "--pane", pane,
-              "--timeout", "120000", timeout=150)
-        herdr(settings, "agent", "prompt", name, agent_prompt(kind, tid, task))
+        flags = agent_flags(kind, model, effort)
+        try:
+            herdr(settings, "agent", "start", name, "--kind", kind, "--pane", pane,
+                  "--timeout", "120000", *(["--", *flags] if flags else []), timeout=150)
+        except HerdrError as err:
+            if err.code != "agent_not_ready":
+                raise
+            note("The agent is waiting at a prompt in its terminal, such as whether to trust "
+                 "this folder. Open Terminal to answer it; the task goes in once it's ready.")
+            wait_ready(settings, pane, 900, kind)
+        herdr(settings, "agent", "prompt", pane, agent_prompt(kind, tid, task))
         note(f"Started {kind} as {name} in herdr workspace {wid}.")
     except (HerdrError, KeyError, TypeError) as err:
         note(f"Couldn't start the agent: {err}")
@@ -672,15 +1043,20 @@ class Handler(BaseHTTPRequestHandler):
             meta["state"] = thread_status(meta)
             h = meta.get("herdr")
             if h:
-                live = agents.get(h["agent"])
+                live = agents.get(h.get("pane") or h.get("agent"))
                 h["live"] = live["agent_status"] if live else None
                 # herdr sees the agent sitting at its prompt even when its last status was busy.
                 if meta["state"] == "busy" and h["live"] in ("idle", "done"):
                     meta["state"] = "idle"
+            meta["service"] = thread_service(meta)
+            meta["agent_kind"] = thread_agent(meta).get("kind")
             threads.append(meta)
         threads.sort(key=lambda m: m["updated"], reverse=True)
         out = {"threads": threads, "now": time.time(), "kinds": list(AGENT_KINDS),
-               "keys": list(HERDR_KEYS), "herdr": bool(HERDR) and not scope, "scope": scope}
+               "keys": list(HERDR_KEYS), "choices": model_suggestions(),
+               "herdr": bool(HERDR) and not scope, "scope": scope,
+               "services": load_usage().get("services") if not scope else None,
+               "service_names": SERVICE_NAMES, "alert_levels": settings["usage_alerts"]}
         tid = scope or query.get("thread", [""])[0]
         if load_thread(tid):
             actions = load_actions()
@@ -770,13 +1146,17 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "Unknown agent kind."}, 400)
         if not task:
             return self.send_json({"error": "Say what the agent should do."}, 400)
+        model, effort = str(data.get("model") or "").strip(), data.get("effort") or ""
+        if err := check_choice(kind, model, effort):
+            return self.send_json({"error": err}, 400)
         title = str(data.get("title", "")).strip()[:60] or cwd.name or str(cwd)
         tid = secrets.token_hex(6)
         new_thread(title, cwd=str(cwd), tid=tid, herdr={"agent": f"dawg-{tid}", "kind": kind})
+        update_thread(tid, lambda m: m.update(agent={"kind": kind}))
         post(tid, {"kind": "text", "from": "user", "body": task}, lambda m: m.update(
             status="busy", delivered=m["seq"]))
-        threading.Thread(target=start_agent, args=(self.server.settings, tid, str(cwd), kind, task),
-                         daemon=True).start()
+        threading.Thread(target=start_agent, args=(self.server.settings, tid, str(cwd), kind, task,
+                                                   model, effort), daemon=True).start()
         self.send_json({"thread": tid})
 
     def api_herdr(self, meta, data):
@@ -785,24 +1165,42 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"error": "This agent isn't running in herdr."}, 400)
         try:
             if op == "read":
-                out = herdr(settings, "agent", "read", h["agent"], "--source", "recent-unwrapped",
+                out = herdr(settings, "agent", "read", herdr_target(meta), "--source", "recent-unwrapped",
                             "--lines", "80", timeout=10)
                 return self.send_json({"output": out if isinstance(out, str) else json.dumps(out)})
             if op == "keys":
                 key = data.get("key")
                 if key not in HERDR_KEYS:
                     return self.send_json({"error": "That key isn't allowed."}, 400)
-                herdr(settings, "agent", "send-keys", h["agent"], key, timeout=10)
+                herdr(settings, "agent", "send-keys", herdr_target(meta), key, timeout=10)
                 return self.send_json({"ok": True})
             if op == "prompt":
                 text = str(data.get("text", "")).strip()
                 if not text:
                     return self.send_json({"error": "Write a prompt first."}, 400)
-                herdr(settings, "agent", "prompt", h["agent"], text, timeout=15)
+                herdr(settings, "agent", "prompt", herdr_target(meta), text, timeout=15)
                 post(meta["id"], {"kind": "system", "from": "system",
                                   "body": f"Typed into the terminal: {text}"})
                 return self.send_json({"ok": True})
+            if op == "settings":
+                model, effort = str(data.get("model") or "").strip(), data.get("effort") or ""
+                kind = thread_agent(meta).get("kind")
+                if err := check_choice(kind, model, effort):
+                    return self.send_json({"error": err}, 400)
+                if not (meta.get("usage") or {}).get("session_id"):
+                    return self.send_json({"error": "Its session isn't known yet: Claude agents "
+                                                    "report it through `dawg statusline` (install.sh "
+                                                    "sets it up), Codex agents once they've run a dawg "
+                                                    "command."}, 400)
+                live = herdr_agents(settings).get(herdr_target(meta))
+                if not live or live["agent_status"] not in ("idle", "done"):
+                    return self.send_json({"error": "Wait until the agent is idle in herdr."}, 409)
+                threading.Thread(target=restart_agent, args=(settings, meta["id"], model, effort),
+                                 daemon=True).start()
+                return self.send_json({"ok": True})
             if op == "close":
+                if h.get("adopted"):
+                    return self.send_json({"error": "This agent's workspace isn't dawg's to close."}, 400)
                 herdr(settings, "workspace", "close", h["workspace"], timeout=15)
                 post(meta["id"], {"kind": "system", "from": "system",
                                   "body": "Closed the herdr workspace."},
@@ -926,6 +1324,7 @@ def serve(_args):
     srv = ThreadingHTTPServer((settings["bind"], settings["port"]), Handler)
     srv.settings = settings
     srv.token = get_token()
+    threading.Thread(target=poll_loop, args=(settings,), daemon=True).start()
     print(f"dawgd listening on {settings['bind']}:{settings['port']}", file=sys.stderr, flush=True)
     if settings["base_url"]:
         print(f"inbox: {settings['base_url']}/m/<token>  (token in {TOKEN_FILE})", file=sys.stderr, flush=True)
@@ -1033,11 +1432,26 @@ def thread_for(args):
     tid = args.thread or NOTIFICATIONS
     if not valid_thread(tid):
         sys.exit(f"dawg {args.cmd}: bad thread id {tid!r}")
-    if meta := load_thread(tid):
-        return meta
-    if tid == NOTIFICATIONS:
-        return new_thread("Notifications", tid=tid)
-    return new_thread(args.title, cwd=os.getcwd(), tid=tid)
+    meta = load_thread(tid)
+    if not meta:
+        meta = (new_thread("Notifications", tid=tid) if tid == NOTIFICATIONS
+                else new_thread(args.title, cwd=os.getcwd(), tid=tid))
+    # Remember which Claude Code or Codex process this agent runs in, so its
+    # usage reports reach this thread.
+    kind, proc = agent_process()
+    if proc and tid != NOTIFICATIONS and thread_agent(meta).get("proc") != proc:
+        meta = update_thread(tid, lambda m: m.update(agent={"kind": kind, "proc": proc}))
+    # An agent running in herdr can be managed from the inbox through its pane.
+    pane = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
+    if pane and tid != NOTIFICATIONS and (meta.get("herdr") or {}).get("pane") != pane:
+        def adopt(m):
+            h = m.get("herdr") or {"kind": kind or "claude", "adopted": True}
+            h.update(pane=pane, workspace=os.environ.get("HERDR_WORKSPACE_ID"))
+            if h.get("adopted"):
+                h["agent"] = None  # addressed by pane until a restart names it
+            m["herdr"] = h
+        meta = update_thread(tid, adopt)
+    return meta
 
 
 def queued_hint(tid):
@@ -1087,6 +1501,20 @@ def inbox_cmd(args):
     return 0
 
 
+def statusline_cmd(args):
+    raw = sys.stdin.read()
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        data = {}
+    try:
+        report_usage(data, load_settings())
+    except Exception as err:  # never break the status line
+        print(f"dawg statusline: {err}", file=sys.stderr)
+    print(status_text(data))
+    return 0
+
+
 def thread_cmd(args):
     if args.action == "new":
         print(new_thread(args.title, cwd=os.getcwd())["id"])
@@ -1127,6 +1555,10 @@ def main():
     s.add_argument("-e", "--expires", type=int, default=3600, help="with -w, seconds (default 3600)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=inbox_cmd)
+    s = sub.add_parser("statusline", prog="dawg statusline",
+                       description="Claude Code status line command: reports model, effort and "
+                                   "usage to the inbox, and prints a short status line.")
+    s.set_defaults(func=statusline_cmd)
     s = sub.add_parser("thread", prog="dawg thread", description="Start or list inbox threads.")
     s.add_argument("action", choices=("new", "list"))
     s.add_argument("-t", "--title", default=os.uname().nodename)

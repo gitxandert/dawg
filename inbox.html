@@ -41,6 +41,15 @@ body{display:flex;flex-direction:column;height:100dvh}
 .dot{width:10px;height:10px;border-radius:50%;flex:none;margin-top:5px;background:var(--idle)}
 .dot.busy{background:var(--busy);animation:pulse 1.6s infinite} .dot.blocked{background:var(--blocked)}
 @keyframes pulse{50%{opacity:.35}}
+.group{padding:10px 14px 8px;background:var(--bg);border-bottom:1px solid var(--line)}
+.gtop{display:flex;align-items:baseline;gap:8px;margin-bottom:4px} .gtop b{font-size:13px}
+.gtop button.link{margin-left:auto;padding:0;background:none;color:var(--accent);font-size:12px}
+.usage{font-size:12px;color:var(--muted);display:grid;gap:5px}
+.usage .row{display:grid;grid-template-columns:52px 1fr auto;gap:8px;align-items:center}
+.bar{height:6px;border-radius:3px;background:var(--bubble);overflow:hidden}
+.bar>i{display:block;height:100%;background:var(--ok)}
+.bar.warn>i{background:var(--blocked)} .bar.bad>i{background:var(--bad)}
+.usage .hot{color:var(--fg);font-weight:600}
 .foot{padding:10px 14px;border-top:1px solid var(--line);font-size:13px;color:var(--muted);display:flex;gap:12px}
 .foot a{color:var(--muted)}
 .main{flex:1;display:flex;flex-direction:column;min-width:0}
@@ -112,12 +121,32 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-w
     <datalist id="cwds"></datalist>
     <label for="nKind">Agent</label>
     <select id="nKind"></select>
+    <div style="display:flex;gap:8px">
+      <div style="flex:1"><label for="nModel">Model</label><input id="nModel" list="nModels" placeholder="default"><datalist id="nModels"></datalist></div>
+      <div style="flex:1"><label for="nEffort">Effort</label><select id="nEffort"></select></div>
+    </div>
     <label for="nTitle">Thread title (optional)</label>
     <input id="nTitle" placeholder="defaults to the directory name">
     <label for="nTask">Task</label>
     <textarea id="nTask" rows="4" required placeholder="What should it work on?"></textarea>
     <div class="err" id="nErr"></div>
     <div class="row"><button value="cancel" formnovalidate>Cancel</button><button class="primary" id="nGo" value="go">Start</button></div>
+  </form>
+</dialog>
+
+<dialog id="setDlg">
+  <form method="dialog" id="setForm">
+    <h2>Model settings</h2>
+    <p class="meta" id="setNow"></p>
+    <div style="display:flex;gap:8px">
+      <div style="flex:1"><label for="sModel">Model</label><input id="sModel" list="sModels" placeholder="default"><datalist id="sModels"></datalist></div>
+      <div style="flex:1"><label for="sEffort">Effort</label><select id="sEffort"></select></div>
+    </div>
+    <p class="meta">Applying restarts the agent on the same conversation with these settings, for this
+      thread only. It takes a few seconds; anything it was waiting on in the background is stopped,
+      and it re-asks open questions.</p>
+    <div class="err" id="sErr"></div>
+    <div class="row"><button value="cancel" formnovalidate>Cancel</button><button class="primary" id="sGo" value="go">Apply</button></div>
   </form>
 </dialog>
 
@@ -185,19 +214,76 @@ async function refresh() {
   renderThread();
 }
 
+// Usage shows as % used or % left; each viewer picks, and the choice is remembered here.
+let usageMode = "used";
+try { usageMode = localStorage.getItem("dawg.usageMode") || "used"; } catch (e) {}
+function toggleUsageMode() {
+  usageMode = usageMode === "used" ? "left" : "used";
+  try { localStorage.setItem("dawg.usageMode", usageMode); } catch (e) {}
+  renderList();
+}
+
+function usageRows(service) {
+  const u = (state.services || {})[service], levels = state.alert_levels || [];
+  if (!u) return [];
+  return u.windows.filter(w => !w.resets_at || w.resets_at > state.now).map(w => {
+    const used = w.used, shown = usageMode === "used" ? used : Math.max(0, 100 - used);
+    const level = used >= Math.max(...levels) ? "bad" : used >= Math.min(...levels) ? "warn" : "";
+    const reset = w.resets_at ? new Date(w.resets_at * 1000).toLocaleString(undefined,
+      w.resets_at - state.now < 86400 ? {hour: "numeric", minute: "2-digit"} : {weekday: "short", hour: "numeric"}) : "";
+    return el("div", {class: "row", title: `${Math.round(used)}% used${reset ? ", resets " + reset : ""}`},
+      el("span", {}, w.label),
+      el("div", {class: `bar ${level}`}, el("i", {style: `width:${Math.min(100, shown)}%`})),
+      el("span", {class: level ? "hot" : ""}, `${Math.round(shown)}% ${usageMode}${reset ? " · " + reset : ""}`));
+  });
+}
+
+function groupHeader(service, count) {
+  const name = (state.service_names || {})[service] || service;
+  const rows = usageRows(service);
+  const local = service !== "claude" && service !== "codex" && service !== "other";
+  const note = rows.length ? null : el("div", {class: "meta"},
+    local ? "Local models: no usage limits." : service === "other" ? "" : "No usage reported yet.");
+  return el("div", {class: "group"},
+    el("div", {class: "gtop"}, el("b", {}, name), el("span", {class: "meta"}, `${count} agent${count === 1 ? "" : "s"}`),
+       rows.length ? el("button", {class: "link", onclick: toggleUsageMode, title: "Switch between % used and % left"},
+                        usageMode === "used" ? "show % left" : "show % used") : null),
+    rows.length ? el("div", {class: "usage"}, ...rows) : note);
+}
+
+function usageText(u) {
+  if (!u || !u.model) return "";
+  const bits = [u.model, u.effort];
+  if (u.context_pct != null) bits.push(`ctx ${Math.round(u.context_pct)}%`);
+  if (u.cost_usd != null) bits.push(`$${u.cost_usd.toFixed(2)}`);
+  return bits.filter(Boolean).join(" · ");
+}
+
+function threadItem(t) {
+  const model = t.usage && t.usage.model;
+  return el("div", {class: "item" + (t.id === sel ? " sel" : ""), onclick: () => select(t.id)},
+    el("span", {class: `dot ${t.state}`, title: t.state}),
+    el("div", {class: "body"},
+      el("div", {class: "top"}, el("span", {class: "title"}, t.title), t.muted ? el("span", {title: "texts muted"}, "🔕") : null,
+         t.unread ? el("span", {class: "badge"}, t.unread) : null, el("span", {class: "when"}, ago(t.updated))),
+      el("div", {class: "prev"}, `${model ? model + " · " : ""}${statusText(t)}${t.preview ? " — " + t.preview : ""}`)));
+}
+
 function renderList() {
   const showArch = $("#showArch").checked;
   const list = $("#list");
   list.replaceChildren();
   const shown = state.threads.filter(t => showArch ? t.archived : !t.archived);
   if (!shown.length) list.append(el("div", {class: "empty"}, showArch ? "No archived threads." : "No agents yet."));
-  for (const t of shown) {
-    list.append(el("div", {class: "item" + (t.id === sel ? " sel" : ""), onclick: () => select(t.id)},
-      el("span", {class: `dot ${t.state}`, title: t.state}),
-      el("div", {class: "body"},
-        el("div", {class: "top"}, el("span", {class: "title"}, t.title), t.muted ? el("span", {title: "texts muted"}, "🔕") : null,
-           t.unread ? el("span", {class: "badge"}, t.unread) : null, el("span", {class: "when"}, ago(t.updated))),
-        el("div", {class: "prev"}, `${statusText(t)}${t.preview ? " — " + t.preview : ""}`))));
+  // Notifications first, then one group per service, each with its account's usage.
+  const notes = shown.find(t => t.id === "notifications");
+  if (notes) list.append(threadItem(notes));
+  const groups = {};
+  for (const t of shown) if (t.id !== "notifications") (groups[t.service] = groups[t.service] || []).push(t);
+  const order = Object.keys(groups).sort((x, y) =>
+    (x === "other") - (y === "other") || ((state.service_names || {})[x] || x).localeCompare((state.service_names || {})[y] || y));
+  for (const service of order) {
+    list.append(groupHeader(service, groups[service].length), ...groups[service].map(threadItem));
   }
   const unread = state.threads.reduce((n, t) => n + (t.archived ? 0 : t.unread), 0);
   const blocked = state.threads.filter(t => !t.archived && t.state === "blocked").length;
@@ -272,12 +358,14 @@ function renderHead(t) {
     el("button", {class: "back", onclick: () => select("")}, "‹"),
     el("div", {class: "name"}, el("b", {}, t.title), el("small", {}, t.cwd || "")),
     el("span", {class: "pill"}, el("span", {class: `dot ${t.state}`}), statusText(t)),
+    usageText(t.usage) ? el("span", {class: "pill", title: "model · effort · context used · session cost"}, usageText(t.usage)) : null,
     h ? el("span", {class: "pill", title: `herdr agent ${h.agent}`}, `herdr: ${live}`) : null,
     h && h.workspace && !scoped ? btn("Terminal", openTerm) : null,
+    h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? btn("Settings", openSettings, "Change this agent's model and effort") : null,
     btn(t.muted ? "🔕 Texts off" : "🔔 Texts on", () => api("thread", {thread: t.id, muted: !t.muted}).then(refresh),
         "Turn phone texts for this thread on or off; the inbox still updates"),
     btn(t.archived ? "Unarchive" : "Archive", () => api("thread", {thread: t.id, archived: !t.archived}).then(refresh)),
-    h && h.workspace && h.live && !scoped ? btn("Close", closeAgent, "Close the agent's herdr workspace") : null,
+    h && h.workspace && h.live && !scoped && !h.adopted ? btn("Close", closeAgent, "Close the agent's herdr workspace") : null,
   ].filter(Boolean));
 }
 
@@ -392,6 +480,35 @@ $("#termSend").onclick = async () => {
   try { await api("herdr", {thread: sel, op: "prompt", text}); $("#termText").value = ""; setTimeout(termRead, 800); }
   catch (e) { $("#termErr").textContent = e.message; }
 };
+// Fill a model field's suggestions and an effort menu with the choices for an agent kind.
+function fillChoices(kind, modelList, effortSel) {
+  const c = (state.choices || {})[kind] || {models: [], efforts: []};
+  modelList.replaceChildren(...c.models.map(m => el("option", {value: m})));
+  effortSel.replaceChildren(el("option", {value: ""}, "default"), ...c.efforts.map(m => el("option", {value: m}, m)));
+  return c;
+}
+
+function openSettings() {
+  const t = thread(), u = t.usage || {}, kind = t.agent_kind || "claude";
+  const c = fillChoices(kind, $("#sModels"), $("#sEffort"));
+  const id = (u.model_id || "").toLowerCase();
+  $("#sModel").value = kind === "claude" ? (c.models.find(m => id.includes(m)) || "") : (u.model || "");
+  $("#sEffort").value = c.efforts.includes(u.effort) ? u.effort : "";
+  $("#setNow").textContent = u.model ? `Now: ${usageText(u)}` : "Current settings unknown until its status line reports.";
+  $("#sErr").textContent = "";
+  $("#setDlg").showModal();
+}
+$("#setForm").addEventListener("submit", async e => {
+  if (e.submitter && e.submitter.value === "cancel") return;
+  e.preventDefault();
+  $("#sGo").disabled = true; $("#sErr").textContent = "";
+  try {
+    await api("herdr", {thread: sel, op: "settings", model: $("#sModel").value, effort: $("#sEffort").value});
+    $("#setDlg").close(); await refresh();
+  } catch (err) { $("#sErr").textContent = err.message; }
+  $("#sGo").disabled = false;
+});
+
 async function closeAgent() {
   if (!confirm("Close this agent's herdr workspace? The agent stops; the thread stays here.")) return;
   try { await api("herdr", {thread: sel, op: "close"}); await refresh(); }
@@ -400,6 +517,8 @@ async function closeAgent() {
 
 $("#newBtn").onclick = () => {
   $("#nKind").replaceChildren(...state.kinds.map(k => el("option", {value: k}, k)));
+  const kindChoices = () => { $("#nModel").value = ""; fillChoices($("#nKind").value, $("#nModels"), $("#nEffort")); };
+  $("#nKind").onchange = kindChoices; kindChoices();
   $("#nErr").textContent = state.herdr ? "" : "herdr isn't installed on this machine.";
   $("#newDlg").showModal();
 };
@@ -408,7 +527,7 @@ $("#newForm").addEventListener("submit", async e => {
   e.preventDefault();
   $("#nGo").disabled = true; $("#nErr").textContent = "";
   try {
-    const r = await api("start", {cwd: $("#nCwd").value, kind: $("#nKind").value, title: $("#nTitle").value, task: $("#nTask").value});
+    const r = await api("start", {cwd: $("#nCwd").value, kind: $("#nKind").value, model: $("#nModel").value, effort: $("#nEffort").value, title: $("#nTitle").value, task: $("#nTask").value});
     $("#newDlg").close(); $("#nTask").value = ""; $("#nTitle").value = "";
     select(r.thread);
   } catch (err) { $("#nErr").textContent = err.message; }

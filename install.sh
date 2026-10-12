@@ -26,6 +26,7 @@ link() {  # link TARGET NAME: point NAME at TARGET, replacing an old symlink
 
 link "$repo/dawg" "$HOME/.local/bin/dawg"
 link "$repo/skill/dawg" "$HOME/.claude/skills/dawg"
+[[ -d "$HOME/.codex" ]] && link "$repo/skill/dawg" "$HOME/.codex/skills/dawg"
 
 mkdir -p "$config"
 chmod 700 "$config"
@@ -68,6 +69,25 @@ if [[ ! -e "$config/actions.toml" ]]; then
   cp "$repo/examples/actions.toml" "$config/actions.toml"
   echo "wrote $config/actions.toml"
 fi
+
+# Claude Code's status line reports each agent's model, effort and usage to the inbox.
+python3 - "$HOME/.claude/settings.json" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+settings = json.loads(path.read_text()) if path.exists() else {}
+current = (settings.get("statusLine") or {}).get("command", "")
+if "dawg statusline" in current:
+    pass
+elif current:
+    print(f"note: {path} already has a status line ({current}); to report usage to the inbox, "
+          "make it run `dawg statusline` (it prints a short status line itself)", file=sys.stderr)
+else:
+    settings["statusLine"] = {"type": "command", "command": "dawg statusline"}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(settings, indent=2) + "\n")
+    print(f"set Claude Code's status line in {path}")
+PY
 
 if [[ $service -eq 1 ]]; then
   unit="$HOME/.config/systemd/user/dawgd.service"
