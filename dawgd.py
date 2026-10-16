@@ -20,7 +20,9 @@ chosen; other options are just recorded so a waiting script can read them.
 A thread is one agent's conversation. The inbox page (/m/<token>) lists
 every thread with its status, shows its messages and asks, answers asks
 inline, queues messages for the agent, mutes a thread's texts, and starts
-new agents in herdr.
+new agents in herdr. For agents in herdr it also shows and switches their
+mode, and mirrors menus in their terminal (such as a plan's approval) into
+the thread, where picking an option presses it in the terminal.
 
 Files:
   ~/.config/dawg/actions.toml   documented action keys -> fixed commands
@@ -361,6 +363,8 @@ def preview(entry):
         text = entry["body"]
     elif kind == "ask":
         text = entry["questions"][0]["message"]
+    elif kind == "prompt":
+        text = entry["question"]
     elif kind == "answer":
         a = entry["answers"][0]
         text = a["text"] if a["option"] == MESSAGE else a["option"]
@@ -381,7 +385,7 @@ def post(tid, entry, change=None):
             meta["preview"] = preview(entry)
         if entry["from"] == "agent":
             meta["archived"] = False
-            if entry["kind"] in ("text", "ask"):
+            if entry["kind"] in ("text", "ask", "prompt"):
                 meta["unread"] += 1
         if change:
             change(meta)
@@ -399,7 +403,7 @@ def read_log(tid, after=0):
 
 
 def thread_status(meta):
-    if any(ask_open(rid) for rid in meta["open_asks"]):
+    if meta.get("prompt") or any(ask_open(rid) for rid in meta["open_asks"]):
         return "blocked"
     return meta["status"]
 
@@ -795,6 +799,20 @@ def herdr_target(meta):
 
 def stop_agent(settings, meta):
     """Exit the thread's herdr agent and close its open asks."""
+    stopping.add(meta["id"])  # its exit dialog is dawgd's to answer, not the user's
+    try:
+        exit_agent(settings, meta)
+    finally:
+        stopping.discard(meta["id"])
+    # Its background commands died with it, so nobody would read answers to open asks.
+    with answer_lock:
+        for rid in meta["open_asks"]:
+            if (req := load_request(rid)) and ask_open(rid):
+                write_json(req_path(rid), {**req, "expires": time.time()})
+    update_thread(meta["id"], lambda m: m.update(open_asks=[], prompt=None))
+
+
+def exit_agent(settings, meta):
     kind, pane = thread_agent(meta)["kind"], meta["herdr"]["pane"]
     herdr(settings, "agent", "prompt", herdr_target(meta),
           "/exit" if kind == "claude" else "/quit", timeout=15)
@@ -808,16 +826,14 @@ def stop_agent(settings, meta):
                 herdr(settings, "agent", "read", pane, "--source", "visible", timeout=10)):
             herdr(settings, "agent", "send-keys", pane, "enter", timeout=10)
         time.sleep(1)
-    # Its background commands died with it, so nobody would read answers to open asks.
-    with answer_lock:
-        for rid in meta["open_asks"]:
-            if (req := load_request(rid)) and ask_open(rid):
-                write_json(req_path(rid), {**req, "expires": time.time()})
-    update_thread(meta["id"], lambda m: m.update(open_asks=[]))
 
 
 def launch_agent(settings, meta, cmd, prompt):
-    """Run cmd in the thread's pane once its agent has exited, then give it prompt."""
+    """Run cmd in the thread's pane once its agent has exited, then give it prompt.
+
+    The new session starts in the user's default mode, so it's put back in
+    the one the old session was in.
+    """
     tid, kind = meta["id"], thread_agent(meta)["kind"]
     pane, name = meta["herdr"]["pane"], meta["herdr"].get("agent") or f"dawg-{tid}"
     usage = meta.get("usage") or {}
@@ -829,6 +845,12 @@ def launch_agent(settings, meta, cmd, prompt):
         wait_ready(settings, pane, 60, kind)
         herdr(settings, "agent", "rename", pane, name, timeout=10)
         update_thread(tid, lambda m: m["herdr"].update(agent=name))
+        if meta.get("mode") in MODES[kind]:
+            try:
+                switch_mode(settings, meta, meta["mode"])
+            except HerdrError as err:
+                post(tid, {"kind": "system", "from": "system",
+                           "body": f"Couldn't put it back in {MODES[kind][meta['mode']]} mode: {err}"})
         submit_prompt(settings, pane, prompt)
     finally:
         launching.discard(tid)
@@ -848,6 +870,7 @@ def restart_agent(settings, tid, model, effort):
 
     label = " · ".join(x for x in (model or "default model", effort and f"{effort} effort") if x)
     note(f"Restarting on {label}…")
+    launching.add(tid)
     try:
         stop_agent(settings, meta)
         cmd = ["claude", "--resume", sid] if kind == "claude" else ["codex", "resume", sid]
@@ -859,6 +882,8 @@ def restart_agent(settings, tid, model, effort):
         note(f"Restarted on {label}.")
     except (HerdrError, KeyError, TypeError) as err:
         note(f"Couldn't restart the agent: {err}")
+    finally:
+        launching.discard(tid)
 
 
 def clear_agent(settings, tid):
@@ -875,6 +900,7 @@ def clear_agent(settings, tid):
     effort = usage.get("effort") or ""
 
     post(tid, {"kind": "system", "from": "system", "body": "Clearing the agent's context…"})
+    launching.add(tid)
     try:
         stop_agent(settings, meta)
         # Messages queued for the old conversation aren't the new one's to act on.
@@ -887,6 +913,268 @@ def clear_agent(settings, tid):
                      agent_prompt(kind, tid))
     except (HerdrError, KeyError, TypeError) as err:
         post(tid, {"kind": "system", "from": "system", "body": f"Couldn't clear the agent: {err}"})
+    finally:
+        launching.discard(tid)
+
+
+# ---------------------------------------------------------------- terminal prompts and modes
+#
+# dawgd reads the screen of each herdr agent with a thread. A numbered menu
+# at the bottom (a plan approval, a permission prompt, Codex's /permissions)
+# becomes a prompt in the thread with the terminal's own options; picking one
+# presses its number, so any mode change the option entails happens in the
+# agent itself. The footer gives the agent's mode, which shift+tab cycles.
+
+MODES = {
+    "claude": {"auto": "Auto", "default": "Manual", "acceptEdits": "Accept edits", "plan": "Plan",
+               "bypassPermissions": "Bypass permissions"},
+    "codex": {"default": "Default", "plan": "Plan"},
+}
+# Modes the inbox offers; Claude has bypass only when started with it.
+MODE_CHOICES = {"claude": ["auto", "default", "acceptEdits", "plan"], "codex": ["default", "plan"]}
+CLAUDE_FOOTER = {"auto mode": "auto", "manual mode": "default", "accept edits": "acceptEdits",
+                 "plan mode": "plan", "bypass permissions": "bypassPermissions"}
+MENU_ITEM = re.compile(r"^\s*([❯›]\s*)?(\d)\.\s+(\S.*?)\s*$")
+# Options that take typed text, like "Tell Claude what to change".
+TEXT_OPTION = re.compile(r"\btell \w+ (what|how)\b|^type something", re.I)
+PLAN_FILE = re.compile(r"~/\.claude/plans/[\w.-]+\.md")
+
+
+def read_screen(settings, meta, history=False):
+    """The agent's screen as lines, without trailing blanks.
+
+    history adds what's scrolled off, with soft wraps joined. It's for when a
+    menu comes up: reading history from an idle agent can move its viewport.
+    """
+    source = ["recent-unwrapped", "--lines", "200"] if history else ["visible"]
+    out = herdr(settings, "agent", "read", herdr_target(meta), "--source", *source, timeout=10)
+    lines = (out if isinstance(out, str) else json.dumps(out)).splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def parse_menu(lines):
+    """The numbered menu at the bottom of the screen, if one is up.
+
+    Returns {question, options: [{n, label, desc, text}], cursor, start}, where
+    start is the first line of the question, so lines[:start] is what the
+    menu is about.
+    """
+    cur = next((i for i in range(len(lines) - 1, max(len(lines) - 30, 0) - 1, -1)
+                if (m := MENU_ITEM.match(lines[i])) and m.group(1)), None)
+    if cur is None:
+        return None
+    col = MENU_ITEM.match(lines[cur]).start(2)
+
+    def part(line):  # an item at the menu's column, or a line continuing one
+        m = MENU_ITEM.match(line)
+        if m and m.start(2) == col:
+            return "item"
+        return "more" if line.strip() and len(line) - len(line.lstrip()) > col else None
+
+    start = cur
+    while start > 0 and part(lines[start - 1]):
+        start -= 1
+    while part(lines[start]) != "item":
+        start += 1
+    end = cur
+    while end + 1 < len(lines) and part(lines[end + 1]):
+        end += 1
+    # A live menu is the bottom of the screen, under at most a hint line or two;
+    # one shown in the transcript has the agent's input box below it.
+    if sum(1 for x in lines[end + 1:] if x.strip()) > 2:
+        return None
+    # A line continues the label above it if its first word wouldn't have fit up
+    # there, so the label wrapped; otherwise it's a hint under the option.
+    width = max(len(x.rstrip()) for x in lines[-60:])
+    options = []
+    for i in range(start, end + 1):
+        if part(lines[i]) == "item":
+            m = MENU_ITEM.match(lines[i])
+            label, *desc = re.split(r"\s{2,}", m.group(3), maxsplit=1)  # Codex puts a description beside it
+            options.append({"n": int(m.group(2)), "label": label, "desc": "".join(desc)})
+            if i == cur:
+                cursor = int(m.group(2))
+        else:
+            o = options[-1]
+            wrapped = len(lines[i - 1].rstrip()) + 1 + len(lines[i].split()[0]) > width
+            key = "label" if not o["desc"] and wrapped else "desc"
+            o[key] = " ".join(x for x in (o[key], lines[i].strip()) if x)
+    for o in options:
+        o["text"] = bool(TEXT_OPTION.search(o["label"]))
+    if len(options) < 2 or [o["n"] for o in options] != list(range(1, len(options) + 1)):
+        return None
+    q = start - 1
+    while q >= 0 and not lines[q].strip():
+        q -= 1
+    question = lines[q].strip() if q >= 0 and start - q <= 3 else ""
+    if question and not re.search(r"\w", question):  # a rule, not a question
+        question, q = "", start
+    return {"question": question, "options": options, "cursor": cursor, "start": max(q, 0)}
+
+
+def menu_sig(menu):
+    """What identifies a menu; a text option's label changes as it's typed into."""
+    return [menu["question"]] + [o["label"] if not o["text"] else "" for o in menu["options"]]
+
+
+def parse_mode(kind, lines):
+    """The agent's mode from its footer, or None if the screen doesn't show it."""
+    tail = [x for x in lines[-6:] if x.strip()]
+    if kind == "claude":
+        for line in reversed(tail):
+            if m := re.search(r"(auto mode|manual mode|accept edits|plan mode|bypass permissions) on\b", line):
+                return CLAUDE_FOOTER[m.group(1)]
+        return None
+    footer = tail[-1].rstrip() if tail else ""
+    if " · " not in footer:
+        return None
+    return "plan" if footer.endswith("Plan mode") else "default"
+
+
+def prompt_context(lines, menu):
+    """What a menu is about: the plan file if it names one, else the screen above it."""
+    for line in lines[menu["start"]:]:
+        if m := PLAN_FILE.search(line):
+            path = Path(m.group(0)).expanduser()
+            with contextlib.suppress(OSError):
+                return "Plan", path.read_text()[:20000]
+    above = lines[max(menu["start"] - 60, 0):menu["start"]]
+    while above and not above[0].strip():
+        above.pop(0)
+    return "Terminal", "\n".join(above).rstrip()
+
+
+def switch_mode(settings, meta, mode):
+    """Press shift+tab until the agent's footer shows mode.
+
+    If the cycle comes back around without it, the agent stays in the mode it started in.
+    """
+    kind = thread_agent(meta)["kind"]
+
+    def current():
+        lines = read_screen(settings, meta)
+        if parse_menu(lines):
+            raise HerdrError("the agent is at a prompt in its terminal", "agent_blocked")
+        return parse_mode(kind, lines)
+
+    start = now = current()
+    for _ in range(len(MODES[kind]) + 1):
+        if not now:
+            raise HerdrError("its terminal doesn't show its mode")
+        update_thread(meta["id"], lambda m: m.update(mode=now))
+        if now == mode:
+            return
+        herdr(settings, "agent", "send-keys", herdr_target(meta), "shift+tab", timeout=10)
+        before, deadline = now, time.time() + 3
+        while (now := current()) == before and time.time() < deadline:
+            time.sleep(0.3)
+        if now == start:
+            break
+    raise HerdrError(f"{MODES[kind][mode]} mode isn't one this agent's shift+tab reaches")
+
+
+# Threads whose terminal dawgd is answering or exiting, which the watcher leaves alone meanwhile.
+choosing, stopping = set(), set()
+prompt_misses = {}
+
+
+def open_prompt(settings, meta, menu):
+    """Post the menu on the agent's screen to its thread; menu is as the visible screen shows it."""
+    pid, sig = secrets.token_hex(8), menu_sig(menu)
+    lines = read_screen(settings, meta, history=True)
+    menu = parse_menu(lines) or menu  # unwrapped, long options read whole
+    label, context = prompt_context(lines, menu)
+    question = menu["question"] or "The agent is waiting in its terminal"
+    post(meta["id"], {"kind": "prompt", "from": "agent", "pid": pid, "question": question,
+                      "options": menu["options"], "context": context, "context_label": label},
+         lambda m: m.update(prompt={"pid": pid, "sig": sig, "question": question,
+                                    "options": menu["options"]}))
+    if not meta["muted"]:
+        notify(meta["title"], f"{question}\n" + " / ".join(o["label"] for o in menu["options"]),
+               url=tap_link(settings, meta, pid))
+
+
+def watch(settings):
+    """Mirror each herdr agent's mode and terminal menus into its thread."""
+    agents = herdr_agents(settings)
+    for p in THREADS_DIR.glob("*.json"):
+        meta = json.loads(p.read_text())
+        tid, kind, h = meta["id"], thread_agent(meta).get("kind"), meta.get("herdr") or {}
+        # An archived thread is still watched until its open prompt closes.
+        if ((meta.get("archived") and not meta.get("prompt")) or kind not in AGENT_KINDS
+                or not h.get("pane") or tid in stopping or tid in choosing):
+            continue
+        menu = None
+        if agents.get(herdr_target(meta)):
+            try:
+                lines = read_screen(settings, meta)
+            except HerdrError:
+                continue
+            menu = parse_menu(lines)
+            mode = None if menu else parse_mode(kind, lines)
+            if mode and mode != meta.get("mode"):
+                update_thread(tid, lambda m: m.update(mode=mode))
+        shown = meta.get("prompt")
+        if menu and shown and shown["sig"] == menu_sig(menu):
+            prompt_misses.pop(tid, None)
+        elif menu:
+            try:
+                open_prompt(settings, meta, menu)
+            except HerdrError:
+                continue
+        elif shown:
+            # Two misses in a row, so a screen caught mid-redraw doesn't close it.
+            prompt_misses[tid] = prompt_misses.get(tid, 0) + 1
+            if prompt_misses[tid] >= 2:
+                prompt_misses.pop(tid)
+                update_thread(tid, lambda m: m.update(prompt=None))
+
+
+def watch_loop(settings):
+    while True:
+        try:
+            watch(settings)
+        except Exception as err:  # keep watching; a thread file can be mid-write
+            print(f"dawgd: watching terminals: {err}", file=sys.stderr, flush=True)
+        time.sleep(2)
+
+
+def choose(settings, meta, pid, n, text):
+    """Pick option n of the terminal prompt pid, typing text into it if it takes text."""
+    tid, target = meta["id"], herdr_target(meta)
+    shown = meta.get("prompt")
+    if not shown or shown["pid"] != pid:
+        raise HerdrError("That prompt isn't open in the terminal anymore.", "gone")
+    opt = next((o for o in shown["options"] if o["n"] == n), None)
+    if not opt:
+        raise HerdrError("Unknown option.", "bad")
+    if text and not opt["text"]:
+        raise HerdrError("That option doesn't take a message.", "bad")
+    choosing.add(tid)
+    try:
+        menu = parse_menu(read_screen(settings, meta))
+        if not menu or menu_sig(menu) != shown["sig"]:
+            raise HerdrError("The terminal has moved on; check it from Terminal.", "gone")
+        herdr(settings, "agent", "send-keys", target, str(n), timeout=10)
+        time.sleep(0.5)
+        if text:
+            herdr(settings, "pane", "send-text", meta["herdr"]["pane"], text, timeout=10)
+            time.sleep(0.3)
+            herdr(settings, "agent", "send-keys", target, "enter", timeout=10)
+        else:
+            # Some menus only move to the number and wait for Enter to confirm.
+            menu = parse_menu(read_screen(settings, meta))
+            if menu and menu_sig(menu) == shown["sig"] and menu["cursor"] == n:
+                herdr(settings, "agent", "send-keys", target, "enter", timeout=10)
+        post(tid, {"kind": "answer", "from": "user", "rid": pid,
+                   "answers": [{"question": shown["question"], "option": opt["label"], "text": text,
+                                "result": None}]},
+             lambda m: m.update(prompt=None, status="busy"))
+        time.sleep(1)  # let the screen settle before the watcher looks again
+    finally:
+        choosing.discard(tid)
 
 
 def trust_folder(kind, cwd):
@@ -951,7 +1239,8 @@ def deliver(settings, tid):
     """
     with deliver_lock:
         meta = load_thread(tid)
-        if not meta or tid in launching or inbox_waiting(tid):
+        # A menu open in its terminal would take the typing as its answer.
+        if not meta or tid in launching or meta.get("prompt") or inbox_waiting(tid):
             return False
         kind, h = thread_agent(meta).get("kind"), meta.get("herdr") or {}
         msgs = [x for x in read_log(tid, meta["delivered"])
@@ -992,25 +1281,31 @@ def agent_prompt(kind, tid, task=None):
     return f"Use the dawg skill ($dawg). {intro}"
 
 
-def prompt_when_ready(settings, pane, kind, prompt, note):
-    """Give a starting agent its first prompt once it's past any dialogs in its terminal."""
+def prompt_when_ready(settings, pane, kind, prompt, note, prepare=None):
+    """Give a starting agent its first prompt once it's past any dialogs in its terminal.
+
+    prepare() runs first, once it's ready.
+    """
     deadline, noted = time.time() + 3600, False
     while True:
         try:
             wait_ready(settings, pane, max(deadline - time.time(), 0), kind)
+            if prepare:
+                prepare()
+                prepare = None
             return submit_prompt(settings, pane, prompt)
         except HerdrError as err:
             # It went idle, then showed another dialog before the prompt went in.
             if err.code != "agent_blocked":
                 raise
         if not noted:
-            note("The agent is waiting at a prompt in its terminal. Open Terminal to answer it; "
-                 "the task goes in once it's ready.")
+            note("The agent is waiting at a prompt in its terminal. Answer it here or from "
+                 "Terminal; the task goes in once it's ready.")
             noted = True
         time.sleep(1)
 
 
-def start_agent(settings, tid, cwd, kind, task, model="", effort="", trust=False):
+def start_agent(settings, tid, cwd, kind, task, model="", effort="", trust=False, mode=""):
     """Open a herdr workspace for the thread and start the agent in it."""
     meta = load_thread(tid)
     name = meta["herdr"]["agent"]
@@ -1040,8 +1335,17 @@ def start_agent(settings, tid, cwd, kind, task, model="", effort="", trust=False
             if err.code != "agent_not_ready":
                 raise
             note("The agent is waiting at a prompt in its terminal, such as whether to trust "
-                 "this folder. Open Terminal to answer it; the task goes in once it's ready.")
-        prompt_when_ready(settings, pane, kind, agent_prompt(kind, tid, task), note)
+                 "this folder. Answer it here or from Terminal; the task goes in once it's ready.")
+
+        def set_mode():
+            try:
+                switch_mode(settings, load_thread(tid), mode)
+            except HerdrError as err:
+                if err.code == "agent_blocked":
+                    raise
+                note(f"Couldn't start it in {MODES[kind][mode]} mode: {err}")
+        prompt_when_ready(settings, pane, kind, agent_prompt(kind, tid, task), note,
+                          set_mode if mode else None)
         note(f"Started {kind} as {name} in herdr workspace {wid}.")
     except (HerdrError, KeyError, TypeError) as err:
         note(f"Couldn't start the agent: {err}")
@@ -1234,16 +1538,19 @@ class Handler(BaseHTTPRequestHandler):
                     meta["state"] = "idle"
             meta["service"] = thread_service(meta)
             meta["agent_kind"] = thread_agent(meta).get("kind")
+            meta["mode_label"] = MODES.get(meta["agent_kind"], {}).get(meta.get("mode"))
             threads.append(meta)
         threads.sort(key=lambda m: m["updated"], reverse=True)
         out = {"threads": threads, "now": time.time(), "kinds": list(AGENT_KINDS),
                "keys": list(HERDR_KEYS), "choices": model_suggestions(),
+               "modes": {k: [{"id": m, "label": MODES[k][m]} for m in ms] for k, ms in MODE_CHOICES.items()},
                "herdr": bool(HERDR) and not scope, "scope": scope,
                "services": load_usage().get("services") if not scope else None,
-               "service_names": SERVICE_NAMES, "alert_levels": settings["usage_alerts"]}
+               "service_names": SERVICE_NAMES, "alert_levels": settings["usage_alerts"],
+               "page": INBOX_PAGE.stat().st_mtime}
         tid = scope or query.get("thread", [""])[0]
-        if load_thread(tid):
-            actions = load_actions()
+        if shown := load_thread(tid):
+            actions, prompt = load_actions(), shown.get("prompt") or {}
             entries = read_log(tid)[-500:]
             for x in entries:
                 if x["kind"] == "ask":
@@ -1253,6 +1560,8 @@ class Handler(BaseHTTPRequestHandler):
                     x["answers"] = ans["answers"] if ans else None
                     x["runs"] = {o: actions[o].get("description") or " ".join(actions[o]["command"])
                                  for q in x["questions"] for o in q["options"] if o in actions}
+                elif x["kind"] == "prompt":
+                    x["open"] = prompt.get("pid") == x["pid"]
             out["entries"] = entries
         self.send_json(out)
 
@@ -1317,6 +1626,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json({"ok": True})
         if name == "herdr":
             return self.api_herdr(meta, data)
+        if name == "choose":
+            if not (meta.get("herdr") or {}).get("pane"):
+                return self.send_json({"error": "This agent isn't running in herdr."}, 400)
+            try:
+                choose(settings, meta, str(data.get("pid", "")), int(data.get("n") or 0),
+                       str(data.get("text") or "").strip())
+            except HerdrError as err:
+                code = {"gone": 409, "bad": 400}.get(err.code, 502)
+                return self.send_json({"error": str(err)}, code)
+            return self.send_json({"ok": True})
         self.send_json({"error": "Unknown call."}, 404)
 
     def api_start(self, data):
@@ -1334,6 +1653,9 @@ class Handler(BaseHTTPRequestHandler):
         model, effort = str(data.get("model") or "").strip(), data.get("effort") or ""
         if err := check_choice(kind, model, effort):
             return self.send_json({"error": err}, 400)
+        mode = data.get("mode") or ""
+        if mode and mode not in MODE_CHOICES[kind]:
+            return self.send_json({"error": "Unknown mode."}, 400)
         title = str(data.get("title", "")).strip()[:60] or cwd.name or str(cwd)
         tid = secrets.token_hex(6)
         new_thread(title, cwd=str(cwd), tid=tid, herdr={"agent": f"dawg-{tid}", "kind": kind})
@@ -1341,7 +1663,7 @@ class Handler(BaseHTTPRequestHandler):
         post(tid, {"kind": "text", "from": "user", "body": task}, lambda m: m.update(
             status="busy", delivered=m["seq"]))
         threading.Thread(target=start_agent, args=(self.server.settings, tid, str(cwd), kind, task,
-                                                   model, effort, bool(data.get("trust"))),
+                                                   model, effort, bool(data.get("trust")), mode),
                          daemon=True).start()
         self.send_json({"thread": tid})
 
@@ -1384,6 +1706,29 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(target=restart_agent, args=(settings, meta["id"], model, effort),
                                  daemon=True).start()
                 return self.send_json({"ok": True})
+            if op == "mode":
+                kind, mode = thread_agent(meta).get("kind"), data.get("mode")
+                if kind not in AGENT_KINDS:
+                    return self.send_json({"error": "Only Claude and Codex agents have modes."}, 400)
+                if meta.get("prompt"):
+                    return self.send_json({"error": "Answer the prompt in its terminal first."}, 409)
+                live = herdr_agents(settings).get(herdr_target(meta))
+                if mode == "permissions" and kind == "codex":
+                    # Its approval presets are a menu, which then shows up here as a prompt.
+                    if not live or live["agent_status"] not in ("idle", "done"):
+                        return self.send_json({"error": "Wait until the agent is idle in herdr."}, 409)
+                    herdr(settings, "pane", "send-text", h["pane"], "/permissions", timeout=10)
+                    time.sleep(0.3)
+                    herdr(settings, "agent", "send-keys", herdr_target(meta), "enter", timeout=10)
+                    return self.send_json({"ok": True})
+                if mode not in MODES[kind]:
+                    return self.send_json({"error": "Unknown mode."}, 400)
+                if not live:
+                    return self.send_json({"error": "The agent isn't running."}, 409)
+                switch_mode(settings, meta, mode)
+                post(meta["id"], {"kind": "system", "from": "system",
+                                  "body": f"Switched to {MODES[kind][mode]} mode."})
+                return self.send_json({"ok": True})
             if op == "clear":
                 if thread_agent(meta).get("kind") not in AGENT_KINDS:
                     return self.send_json({"error": "Only Claude and Codex agents can be cleared."}, 400)
@@ -1399,7 +1744,7 @@ class Handler(BaseHTTPRequestHandler):
                 herdr(settings, "workspace", "close", h["workspace"], timeout=15)
                 post(meta["id"], {"kind": "system", "from": "system",
                                   "body": "Closed the herdr workspace."},
-                     lambda m: m.update(status="idle"))
+                     lambda m: m.update(status="idle", prompt=None))
                 return self.send_json({"ok": True})
         except (HerdrError, KeyError) as err:
             return self.send_json({"error": str(err)}, 502)
@@ -1521,6 +1866,7 @@ def serve(_args):
     srv.token = get_token()
     threading.Thread(target=poll_loop, args=(settings,), daemon=True).start()
     threading.Thread(target=deliver_loop, args=(settings,), daemon=True).start()
+    threading.Thread(target=watch_loop, args=(settings,), daemon=True).start()
     print(f"dawgd listening on {settings['bind']}:{settings['port']}", file=sys.stderr, flush=True)
     if settings["base_url"]:
         print(f"inbox: {settings['base_url']}/m/<token>  (token in {TOKEN_FILE})", file=sys.stderr, flush=True)

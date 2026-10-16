@@ -29,9 +29,8 @@
 set -u
 
 dawgd="$(dirname "$(readlink -f "$0")")/dawgd.py"
-case "${1:-}" in
-  ask|status|inbox|thread|statusline) exec python3 "$dawgd" "$@" ;;
-esac
+subcommand() { [[ "${1:-}" =~ ^(ask|status|inbox|thread|statusline)$ ]]; }
+subcommand "${1:-}" && exec python3 "$dawgd" "$@"
 
 server="${DAWG_SERVER:-https://api.day.app}"
 key="${DAWG_KEY:-}"
@@ -45,11 +44,12 @@ fi
 
 title="$(hostname)"
 group="" level="" sound="" url="" action="" thread="${DAWG_THREAD:-notifications}"
+given=()  # -T, -t and -g as given, for a subcommand that comes after them
 while getopts ":T:t:g:l:s:u:a:h" opt; do
   case "$opt" in
-    T) thread="$OPTARG" ;;
-    t) title="$OPTARG" ;;
-    g) group="$OPTARG" ;;
+    T) thread="$OPTARG"; given+=(-T "$OPTARG") ;;
+    t) title="$OPTARG"; given+=(-t "$OPTARG") ;;
+    g) group="$OPTARG"; given+=(-g "$OPTARG") ;;
     l) level="$OPTARG" ;;
     s) sound="$OPTARG" ;;
     u) url="$OPTARG" ;;
@@ -59,6 +59,18 @@ while getopts ":T:t:g:l:s:u:a:h" opt; do
   esac
 done
 shift $((OPTIND - 1))
+
+# `dawg -T ID status busy` means the subcommand, not a message.
+if subcommand "${1:-}"; then
+  sub="$1"; shift
+  args=()
+  for ((i = 0; i < ${#given[@]}; i += 2)); do
+    case "$sub:${given[i]}" in  # only the options each subcommand takes
+      ask:*|status:-[Tt]|inbox:-[Tt]|thread:-t) args+=("${given[i]}" "${given[i+1]}") ;;
+    esac
+  done
+  exec python3 "$dawgd" "$sub" "${args[@]}" "$@"
+fi
 
 send() {
   local body="$1"

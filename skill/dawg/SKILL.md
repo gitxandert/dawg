@@ -88,10 +88,18 @@ locked while the user is active over SSH.
 - **While away (non-interactive):** send one-way `dawg` messages for
   milestones and completion.
 - **Plan mode:** a phone reply can't take you out of plan mode. Only the
-  terminal approval prompt can. If away mode starts in plan mode, say so in
-  the terminal. When the user approves a plan by phone, finish everything
-  plan mode allows. Then ask for approval and send an ask saying the approval
-  is waiting in the terminal.
+  terminal approval prompt can. Write the plan as you would for the
+  terminal, without mentioning dawg, the inbox or how the task reached you.
+  Approval doesn't end away mode: when the approved work is done, send the
+  wrap-up ask as for any task.
+  - In herdr (`HERDR_ENV=1`), the inbox shows that prompt in your thread
+    with the terminal's own options, and texts the user. Present your plan
+    the usual way and don't send an ask about it. The user can also switch
+    your mode from the inbox.
+  - Otherwise, say in the terminal that away mode started in plan mode.
+    When the user approves a plan by phone, finish everything plan mode
+    allows. Then ask for approval and send an ask saying the approval is
+    waiting in the terminal.
 - **Exit** when any new message arrives in the terminal, except one that
   starts with `[dawg inbox`: the user is back.
   Stop the pending background `dawg ask` or `dawg inbox -w` (TaskStop), set

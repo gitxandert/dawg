@@ -99,6 +99,24 @@ and it goes straight into away mode. For those agents the thread also shows
 herdr's view of the agent, a **Terminal** to read its screen and press keys
 (for permission prompts), and **Close** to end its workspace.
 
+**Mode** shows a Claude or Codex agent's mode as its terminal footer shows
+it, and switches it: Auto, Manual, Accept edits or Plan for Claude, Default
+or Plan for Codex. dawg presses shift+tab in the agent's terminal until the
+mode it picked shows. For Codex, **Permissions…** opens its approval
+presets. **New agent** takes a starting mode too, and an agent restarted
+by **Settings** or **Clear** comes back in the mode it was in.
+
+When an agent in herdr stops at a numbered menu in its terminal (a plan
+waiting for approval, a permission prompt, a startup question), its thread
+shows that menu with the terminal's own options, the plan or the screen
+above it, and texts you unless the thread is muted. Picking an option
+presses its number in the terminal, so an option that changes the mode
+("Yes, and use auto mode", Codex's "Yes, implement this plan") changes it
+there too. An option that takes a message, such as "Tell Claude what to
+change", sends what you type in the box under the options. The thread shows
+the agent as blocked until the menu is gone, and dawg doesn't type queued
+messages into it meanwhile.
+
 **Clear** starts a Claude or Codex agent in herdr over with an empty
 context, as `/clear` would, while it's idle. It exits the agent and starts a
 new session in the same pane, with the same thread, model and effort, so

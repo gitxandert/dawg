@@ -78,6 +78,14 @@ body{display:flex;flex-direction:column;height:100dvh}
 .ask .row{display:flex;gap:6px;margin-top:8px;justify-content:flex-end}
 .ask .state{font-size:12px;color:var(--muted);margin-top:6px}
 .answer b{font-weight:600}
+.ask details{margin:4px 0 6px} .ask summary{cursor:pointer;color:var(--muted);font-size:13px}
+.ask details pre{max-height:50vh;overflow:auto}
+.md{background:var(--bg);padding:4px 12px;border-radius:8px;margin:6px 0 0;max-height:60vh;overflow:auto;white-space:normal}
+.md h1,.md h2,.md h3,.md h4{font-size:15px;margin:10px 0 4px} .md h1{font-size:17px}
+.md p{margin:6px 0} .md ul,.md ol{margin:6px 0;padding-left:22px} .md li{margin:2px 0}
+.md code{font:12px ui-monospace,Menlo,monospace;background:var(--bubble);padding:1px 4px;border-radius:4px}
+.md pre code{background:none;padding:0} .md blockquote{margin:6px 0;padding-left:10px;border-left:3px solid var(--line);color:var(--muted)}
+.thead select{width:auto;padding:2px 8px;border-radius:12px;font-size:13px;background:var(--bubble);border:0}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:8px;border-radius:8px;font-size:12px;margin:6px 0 0}
 .ok{color:var(--ok)} .bad{color:var(--bad)}
 .compose{display:flex;gap:8px;padding:10px 14px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--card);align-items:flex-end}
@@ -126,6 +134,7 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-w
     <div style="display:flex;gap:8px">
       <div style="flex:1"><label for="nModel">Model</label><input id="nModel" list="nModels" placeholder="default"><datalist id="nModels"></datalist></div>
       <div style="flex:1"><label for="nEffort">Effort</label><select id="nEffort"></select></div>
+      <div style="flex:1"><label for="nMode">Mode</label><select id="nMode"></select></div>
     </div>
     <label style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="nTrust" checked style="width:auto">
       Trust this folder, so the agent doesn't ask in its terminal</label>
@@ -203,11 +212,22 @@ function ago(ts) {
 const clock = ts => new Date(ts * 1000).toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"});
 const statusText = t => t.state + (t.state === t.status && t.status_note ? ` · ${t.status_note}` : "");
 
+// An open inbox keeps running the page it loaded; reload when dawgd serves a
+// newer one, unless that would lose a message being written or an open dialog.
+let pageVersion = null;
+function stale(version) {
+  if (pageVersion === null) pageVersion = version;
+  if (version === pageVersion) return false;
+  const typing = [...document.querySelectorAll("#main textarea")].some(n => n.value.trim());
+  return !typing && !document.querySelector("dialog[open]");
+}
+
 async function refresh() {
   try {
     const r = await fetch(`${BASE}/api/state?thread=${encodeURIComponent(sel)}`, {cache: "no-store"});
     if (!r.ok) throw new Error(r.status);
     state = await r.json();
+    if (stale(state.page)) return location.reload();
     if (state.scope && !scoped) enterScope(state.scope);
     $("#conn").textContent = "";
   } catch (e) {
@@ -349,12 +369,32 @@ function renderThread() {
   if (maxSeq > lastSeq) { lastSeq = maxSeq; if (t.unread && !document.hidden) api("thread", {thread: t.id, read: true}).catch(() => {}); }
   const open = (state.entries || []).filter(x => x.kind === "ask" && x.open);
   const single = open.find(x => x.questions.length === 1 && x.allow_text);
-  $("#hint").textContent = single ? "Your message answers the open question above."
+  const prompt = (state.entries || []).some(x => x.kind === "prompt" && x.open);
+  $("#hint").textContent = prompt ? "The agent is waiting at a prompt in its terminal; answer it above."
+    : single ? "Your message answers the open question above."
     : open.length ? "The agent is waiting on the question above; messages queue until it checks in."
     : t.state === "busy" ? "Messages queue until the agent checks in." : "";
 }
 
+// The agent's mode; switching it presses shift+tab in its terminal until the mode shows.
+function modeControl(t) {
+  const modes = (state.modes || {})[t.agent_kind] || [];
+  const known = modes.some(m => m.id === t.mode);
+  return el("select", {class: "mode", title: "The agent's mode, as its terminal shows it", onchange: async e => {
+      e.target.disabled = true;
+      try { await api("herdr", {thread: t.id, op: "mode", mode: e.target.value}); }
+      catch (err) { alert(err.message); }
+      e.target.blur(); refresh();
+    }},
+    t.mode ? null : el("option", {value: "", selected: true, disabled: true}, "Mode"),
+    t.mode && !known ? el("option", {value: t.mode, selected: true}, `${t.mode_label || t.mode} mode`) : null,
+    ...modes.map(m => el("option", {value: m.id, selected: m.id === t.mode}, `${m.label} mode`)),
+    t.agent_kind === "codex" ? el("option", {value: "permissions"}, "Permissions…") : null);
+}
+
 function renderHead(t) {
+  // Rebuilding the header would close a mode menu that's open.
+  if (document.activeElement && document.activeElement.classList.contains("mode")) return;
   const h = t.herdr;
   const live = h ? (h.live || (h.workspace ? "gone" : "starting")) : null;
   const btn = (label, fn, title) => el("button", {onclick: fn, title}, label);
@@ -363,6 +403,7 @@ function renderHead(t) {
     el("div", {class: "name"}, el("b", {}, t.title), el("small", {}, t.cwd || "")),
     el("span", {class: "pill"}, el("span", {class: `dot ${t.state}`}), statusText(t)),
     usageText(t.usage) ? el("span", {class: "pill", title: "model · effort · context used · session cost"}, usageText(t.usage)) : null,
+    h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? modeControl(t) : null,
     h ? el("span", {class: "pill", title: `herdr agent ${h.agent}`}, `herdr: ${live}`) : null,
     h && h.workspace && !scoped ? btn("Terminal", openTerm) : null,
     h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? btn("Settings", openSettings, "Change this agent's model and effort") : null,
@@ -399,7 +440,89 @@ function renderEntry(x, t) {
       meta(clock(x.ts)));
   }
   if (x.kind === "ask") return renderAsk(x, t);
+  if (x.kind === "prompt") return renderPrompt(x, t);
   return el("div", {class: "sys"}, x.kind);
+}
+
+// A small Markdown renderer for plans: headings, lists, code, quotes, emphasis.
+// Everything is escaped first, so the plan's text can't add markup of its own.
+function markdown(src) {
+  const esc = t => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const inline = t => esc(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[^\w*])[*_]([^*_\s][^*_]*?)[*_](?=$|[^\w*])/g, "$1<i>$2</i>")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1");
+  const out = [], lines = src.replace(/\r/g, "").split("\n");
+  let list = null, para = [];
+  const flush = () => {
+    if (para.length) out.push(`<p>${inline(para.join(" "))}</p>`);
+    para = [];
+    if (list) out.push(`<${list.tag}>${list.items.map(i => `<li>${inline(i)}</li>`).join("")}</${list.tag}>`);
+    list = null;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    let m;
+    if (/^\s*```/.test(line)) {
+      flush();
+      const code = [];
+      while (++i < lines.length && !/^\s*```/.test(lines[i])) code.push(lines[i]);
+      out.push(`<pre><code>${esc(code.join("\n"))}</code></pre>`);
+    } else if ((m = line.match(/^(#{1,6})\s+(.*)/))) {
+      flush(); const n = Math.min(m[1].length, 4); out.push(`<h${n}>${inline(m[2])}</h${n}>`);
+    } else if ((m = line.match(/^\s*([-*+]|\d+[.)])\s+(.*)/))) {
+      const tag = /\d/.test(m[1]) ? "ol" : "ul";
+      if (para.length || (list && list.tag !== tag)) flush();
+      list = list || {tag, items: []};
+      list.items.push(m[2]);
+    } else if ((m = line.match(/^>\s?(.*)/))) {
+      flush(); out.push(`<blockquote>${inline(m[1])}</blockquote>`);
+    } else if (!line.trim()) {
+      flush();
+    } else if (list && /^\s+\S/.test(line)) {
+      list.items[list.items.length - 1] += " " + line.trim();
+    } else {
+      if (list) flush();
+      para.push(line.trim());
+    }
+  }
+  flush();
+  const div = el("div", {class: "md"});
+  div.innerHTML = out.join("");
+  return div;
+}
+
+// A menu in the agent's terminal, with its own options; picking one presses its number there.
+function renderPrompt(x, t) {
+  const card = el("div", {class: "msg agent ask", "data-rid": x.pid});
+  const err = el("div", {class: "err"});
+  card.append(el("div", {class: "meta"}, "In the terminal"), el("div", {class: "q"}, x.question));
+  if (x.context) {
+    card.append(el("details", {open: x.open && x.context_label === "Plan"},
+      el("summary", {}, x.context_label === "Plan" ? "Plan" : "Screen"),
+      x.context_label === "Plan" ? markdown(x.context) : el("pre", {}, x.context)));
+  }
+  if (x.open) {
+    const takesText = x.options.filter(o => o.text);
+    const ta = takesText.length ? el("textarea", {rows: 2, placeholder: `For “${takesText[0].label}”`}) : null;
+    const pick = async o => {
+      const text = o.text ? ta.value.trim() : "";
+      if (o.text && !text) { err.textContent = "Write your message first, then tap it again."; ta.focus(); return; }
+      err.textContent = "";
+      card.querySelectorAll("button").forEach(b => b.disabled = true);
+      try { await api("choose", {thread: t.id, pid: x.pid, n: o.n, text}); await refresh(); }
+      catch (e) { err.textContent = e.message; card.querySelectorAll("button").forEach(b => b.disabled = false); }
+    };
+    card.append(el("div", {class: "opts"}, x.options.map(o =>
+      el("button", {onclick: () => pick(o)}, `${o.n}. ${o.label}`, o.desc ? el("small", {}, o.desc) : null))));
+    if (ta) card.append(ta);
+  }
+  card.append(err);
+  const answered = (state.entries || []).some(y => y.kind === "answer" && y.rid === x.pid);
+  const status = answered ? "answered" : x.open ? "waiting in the terminal" : "closed in the terminal";
+  card.append(el("div", {class: "meta"}, `${clock(x.ts)} · ${status}`));
+  return card;
 }
 
 function renderAsk(x, t) {
@@ -529,7 +652,11 @@ async function closeAgent() {
 
 $("#newBtn").onclick = () => {
   $("#nKind").replaceChildren(...state.kinds.map(k => el("option", {value: k}, k)));
-  const kindChoices = () => { $("#nModel").value = ""; fillChoices($("#nKind").value, $("#nModels"), $("#nEffort")); };
+  const kindChoices = () => {
+    $("#nModel").value = ""; fillChoices($("#nKind").value, $("#nModels"), $("#nEffort"));
+    $("#nMode").replaceChildren(el("option", {value: ""}, "default"),
+      ...((state.modes || {})[$("#nKind").value] || []).map(m => el("option", {value: m.id}, m.label)));
+  };
   $("#nKind").onchange = kindChoices; kindChoices();
   $("#nErr").textContent = state.herdr ? "" : "herdr isn't installed on this machine.";
   $("#newDlg").showModal();
@@ -539,7 +666,7 @@ $("#newForm").addEventListener("submit", async e => {
   e.preventDefault();
   $("#nGo").disabled = true; $("#nErr").textContent = "";
   try {
-    const r = await api("start", {cwd: $("#nCwd").value, kind: $("#nKind").value, model: $("#nModel").value, effort: $("#nEffort").value, trust: $("#nTrust").checked, title: $("#nTitle").value, task: $("#nTask").value});
+    const r = await api("start", {cwd: $("#nCwd").value, kind: $("#nKind").value, model: $("#nModel").value, effort: $("#nEffort").value, mode: $("#nMode").value, trust: $("#nTrust").checked, title: $("#nTitle").value, task: $("#nTask").value});
     $("#newDlg").close(); $("#nTask").value = ""; $("#nTitle").value = "";
     select(r.thread);
   } catch (err) { $("#nErr").textContent = err.message; }
