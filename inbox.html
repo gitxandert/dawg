@@ -109,6 +109,11 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-w
 .keys{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 .keys button{font:12px ui-monospace,Menlo,monospace;padding:6px 9px}
 .back{display:none}
+#nTree{border:1px solid var(--line);border-radius:9px;padding:8px;margin-top:8px}
+#nTree .path{font:12px ui-monospace,Menlo,monospace;word-break:break-all;color:var(--muted)}
+#nDirs{max-height:200px;overflow:auto;display:grid;margin:6px 0}
+#nDirs button{text-align:left;background:none;border-radius:6px;padding:7px 8px}
+#nDirs button:hover{background:var(--bubble)}
 .scoped .side,.scoped .back{display:none!important} .scoped .main{display:flex!important}
 .banner{background:var(--bubble);color:var(--muted);font-size:13px;padding:8px 14px;border-bottom:1px solid var(--line)}
 @media (max-width:720px){
@@ -139,8 +144,13 @@ dialog .row{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-w
     <h2>New agent</h2>
     <p class="meta" id="herdrNote">Starts the agent in a new herdr workspace, with its own thread here.</p>
     <label for="nCwd">Directory</label>
-    <input id="nCwd" list="cwds" placeholder="~/project" required>
+    <div style="display:flex;gap:8px"><input id="nCwd" list="cwds" placeholder="~/project, or Browse…" required style="flex:1;min-width:0"><button type="button" id="nBrowse">Browse…</button></div>
     <datalist id="cwds"></datalist>
+    <div id="nTree" hidden>
+      <div class="path" id="nTreePath"></div>
+      <div id="nDirs"></div>
+      <div class="row" style="margin-top:0"><button type="button" class="primary" id="nUse">Use this folder</button></div>
+    </div>
     <label for="nKind">Agent</label>
     <select id="nKind"></select>
     <div style="display:flex;gap:8px">
@@ -290,9 +300,9 @@ function usageRows(service) {
 function groupHeader(service, count) {
   const name = (state.service_names || {})[service] || service;
   const rows = usageRows(service);
-  const local = service !== "claude" && service !== "codex" && service !== "other";
+  const local = !["claude", "codex", "omp", "other"].includes(service);
   const note = rows.length ? null : el("div", {class: "meta"},
-    local ? "Local models: no usage limits." : service === "other" ? "" : "No usage reported yet.");
+    local ? "Local models: no usage limits." : ["other", "omp"].includes(service) ? "" : "No usage reported yet.");
   return el("div", {class: "group"},
     el("div", {class: "gtop"}, el("b", {}, name), el("span", {class: "meta"}, `${count} agent${count === 1 ? "" : "s"}`),
        rows.length ? el("button", {class: "link", onclick: toggleUsageMode, title: "Switch between % used and % left"},
@@ -446,10 +456,11 @@ function renderHead(t) {
     el("span", {class: "pill state", title: statusText(t)}, el("span", {class: `dot ${t.state}`}), el("span", {}, statusText(t)))),
   el("div", {class: "tools"}, ...[
     usageText(t.usage) ? el("span", {class: "pill", title: "model · effort · context used · session cost"}, usageText(t.usage)) : null,
+    t.agent_kind === "omp" && t.mode_label ? el("span", {class: "pill", title: "The approval mode it was started with"}, t.mode_label) : null,
     h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? modeControl(t) : null,
     h ? el("span", {class: "pill", title: `herdr agent ${h.agent}`}, `herdr: ${live}`) : null,
     h && h.workspace && !scoped ? btn("Terminal", openTerm) : null,
-    h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? btn("Settings", openSettings, "Change this agent's model and effort") : null,
+    h && h.live && !scoped && ["claude", "codex", "omp"].includes(t.agent_kind) ? btn("Settings", openSettings, "Change this agent's model and effort") : null,
     h && h.live && !scoped && ["claude", "codex"].includes(t.agent_kind) ? btn("Clear", clearAgent, "Start the agent over with an empty context, like /clear; the messages stay") : null,
     btn(t.muted ? "🔕 Texts off" : "🔔 Texts on", () => api("thread", {thread: t.id, muted: !t.muted}).then(refresh),
         "Turn phone texts for this thread on or off; the inbox still updates"),
@@ -661,12 +672,24 @@ $("#termSend").onclick = async () => {
   try { await api("herdr", {thread: sel, op: "prompt", text}); saveDraft(draftKey(sel, "term"), ""); $("#termText").value = ""; setTimeout(termRead, 800); }
   catch (e) { $("#termErr").textContent = e.message; }
 };
-// Fill the model and effort menus with the choices for an agent kind. Codex takes any model
-// name, so its menu ends with "Other…", which shows a text field for one.
+// What the server offers per agent kind: models each agent lists, efforts, modes, and what "default"
+// stands for. Fetched when a form opens, since omp's model list is long and rarely changes.
+let choices = {};
+async function loadChoices(errEl) {
+  try { choices = await api("choices", {}); }
+  catch (e) { errEl.textContent = `Couldn't load the model list: ${e.message}`; }
+}
+const withDefault = (label, v) => v ? `${label} (${v})` : label;
+// Fill the model and effort menus with the choices for an agent kind; omp's are grouped by provider.
+// Codex and omp take any model name, so their menus end with "Other…", which shows a text field for one.
 function fillChoices(kind, modelSel, other, effortSel) {
-  const c = (state.choices || {})[kind] || {models: [], efforts: []};
-  modelSel.replaceChildren(el("option", {value: ""}, "default"), ...c.models.map(m => el("option", {value: m}, m)),
-    kind === "codex" ? el("option", {value: "\u0000other"}, "Other…") : null);
+  const c = choices[kind] || {models: [], efforts: [], modes: [], default: {}};
+  const groups = {};
+  for (const m of c.models) (groups[kind === "omp" ? m.split("/")[0] : ""] ||= []).push(m);
+  const opt = m => el("option", {value: m}, m);
+  modelSel.replaceChildren(el("option", {value: ""}, withDefault("default", c.default.model)),
+    ...Object.entries(groups).map(([g, ms]) => g ? el("optgroup", {label: g}, ms.map(opt)) : ms.map(opt)).flat(),
+    ...(kind !== "claude" ? [el("option", {value: "\u0000other"}, "Other…")] : []));
   modelSel.onchange = () => { other.hidden = modelSel.value !== "\u0000other"; if (!other.hidden) other.focus(); };
   other.value = ""; other.hidden = true;
   effortSel.replaceChildren(el("option", {value: ""}, "default"), ...c.efforts.map(m => el("option", {value: m}, m)));
@@ -682,14 +705,16 @@ function setModel(modelSel, other, model) {
 }
 const modelValue = (modelSel, other) => modelSel.value === "\u0000other" ? other.value.trim() : modelSel.value;
 
-function openSettings() {
+async function openSettings() {
   const t = thread(), u = t.usage || {}, kind = t.agent_kind || "claude";
+  $("#sErr").textContent = "";
+  await loadChoices($("#sErr"));
   const c = fillChoices(kind, $("#sModel"), $("#sModelOther"), $("#sEffort"));
   const id = (u.model_id || "").toLowerCase();
   setModel($("#sModel"), $("#sModelOther"), kind === "claude" ? (c.models.find(m => id.includes(m)) || "") : (u.model || ""));
   $("#sEffort").value = c.efforts.includes(u.effort) ? u.effort : "";
-  $("#setNow").textContent = u.model ? `Now: ${usageText(u)}` : "Current settings unknown until its status line reports.";
-  $("#sErr").textContent = "";
+  $("#setNow").textContent = u.model ? `Now: ${usageText(u)}` : kind === "omp" ? "omp doesn't report its current model; effort is its thinking level."
+    : "Current settings unknown until its status line reports.";
   $("#setDlg").showModal();
 }
 $("#setForm").addEventListener("submit", async e => {
@@ -721,15 +746,18 @@ async function closeAgent() {
   catch (e) { alert(e.message); }
 }
 
-$("#newBtn").onclick = () => {
+$("#newBtn").onclick = async () => {
   $("#nKind").replaceChildren(...state.kinds.map(k => el("option", {value: k}, k)));
+  $("#nErr").textContent = state.herdr ? "" : "herdr isn't installed on this machine.";
+  await loadChoices($("#nErr"));
   const kindChoices = () => {
-    fillChoices($("#nKind").value, $("#nModel"), $("#nModelOther"), $("#nEffort"));
-    $("#nMode").replaceChildren(el("option", {value: ""}, "default"),
-      ...((state.modes || {})[$("#nKind").value] || []).map(m => el("option", {value: m.id}, m.label)));
+    const c = fillChoices($("#nKind").value, $("#nModel"), $("#nModelOther"), $("#nEffort"));
+    const dm = (c.modes.find(m => m.id === c.default.mode) || {}).label || c.default.mode;
+    $("#nMode").replaceChildren(el("option", {value: ""}, withDefault("default", dm || "agent's own")),
+      ...c.modes.map(m => el("option", {value: m.id}, m.label)));
   };
   $("#nKind").onchange = kindChoices; kindChoices();
-  $("#nErr").textContent = state.herdr ? "" : "herdr isn't installed on this machine.";
+  $("#nTree").hidden = true;
   $("#newDlg").showModal();
 };
 $("#newForm").addEventListener("submit", async e => {
@@ -743,6 +771,23 @@ $("#newForm").addEventListener("submit", async e => {
   } catch (err) { $("#nErr").textContent = err.message; }
   $("#nGo").disabled = false;
 });
+
+// Folder picker: a phone user rarely knows an absolute path, so browse from the typed path (or home).
+async function browse(path) {
+  try {
+    const r = await api("dirs", {path});
+    $("#nTreePath").textContent = r.path;
+    $("#nTree").dataset.path = r.path;
+    $("#nDirs").replaceChildren(
+      ...(r.parent ? [el("button", {type: "button", onclick: () => browse(r.parent)}, "⬆ ..")] : []),
+      ...r.dirs.map(d => el("button", {type: "button", onclick: () => browse(d.path)}, `📁 ${d.name}`)),
+      ...(r.dirs.length ? [] : [el("div", {class: "meta"}, "No subfolders")]));
+    $("#nTree").hidden = false;
+    $("#nErr").textContent = "";
+  } catch (e) { $("#nErr").textContent = e.message; }
+}
+$("#nBrowse").onclick = () => $("#nTree").hidden ? browse($("#nCwd").value) : ($("#nTree").hidden = true);
+$("#nUse").onclick = () => { $("#nCwd").value = $("#nTree").dataset.path; $("#nTree").hidden = true; };
 
 $("#showArch").onchange = renderList;
 $("#actionsLink").href = BASE.replace(/\/m\//, "/a/");

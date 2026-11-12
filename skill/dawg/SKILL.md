@@ -5,7 +5,7 @@ description: Dispatched Alerts While Gone. Text the user on their phone and get 
 
 # dawg
 
-`dawg` sends push notifications to the user's iPhone through the Bark app.
+`dawg` sends push notifications through Bark on iOS or ntfy on Android.
 `dawg ask` sends one whose tap opens a reply page served by `dawgd` over
 HTTPS on the user's tailnet, and can block until they answer. Together they
 make a text channel: you send, they reply from the phone.

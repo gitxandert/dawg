@@ -1,0 +1,18 @@
+# Private ntfy server for Android notifications; see "Private ntfy server" in README.md.
+# Start with: NTFY_BIND=$(tailscale ip -4) docker compose up -d
+services:
+  ntfy:
+    container_name: ntfy
+    image: binwiederhier/ntfy
+    command: serve
+    restart: unless-stopped
+    ports:
+      - "${NTFY_BIND:?set NTFY_BIND to this machine's Tailscale IP}:2586:80"
+    environment:
+      NTFY_AUTH_FILE: /var/lib/ntfy/auth.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all
+    volumes:
+      - ntfy:/var/lib/ntfy
+
+volumes:
+  ntfy:

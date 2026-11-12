@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dawgd - reply to Bark notifications from your phone.
+"""dawgd - reply to push notifications from your phone.
 
 Subcommands:
   dawgd.py serve                     run the reply server (Tailscale-only)
@@ -70,7 +70,7 @@ STATUSES = ("busy", "blocked", "idle")
 NOTIFICATIONS = "notifications"
 COOKIE = "dawg_inbox"
 # Agents the inbox can start in herdr, and the keys it can press for them.
-AGENT_KINDS = ("claude", "codex")
+AGENT_KINDS = ("claude", "codex", "omp")
 HERDR_KEYS = ("enter", "esc", "up", "down", "tab", "ctrl+c", "1", "2", "3", "y", "n")
 
 # Option recorded when the user sends their own message instead of a listed option.
@@ -121,7 +121,7 @@ def get_token():
 
 
 def notify(title, body, url=None, group="dawgd", level=None, sound=None):
-    """Send a text. Without a url, tapping it does nothing (Bark's action=none)."""
+    """Send a text; only attach a browser link when a URL is supplied."""
     cmd = [DAWG, "-t", title, "-g", group]
     for flag, value in (("-u", url), ("-a", None if url else "none"), ("-l", level), ("-s", sound)):
         if value:
@@ -437,13 +437,15 @@ def queued_count(tid):
 
 CODEX_SESSIONS = Path.home() / ".codex" / "sessions"
 # Model and effort choices per agent kind; "" keeps the user's default.
-# Codex takes any model name; the inbox suggests ones it has seen.
+# Codex and omp take any model name; the inbox suggests the ones each lists (see model_suggestions).
 CHOICES = {
     "claude": {"models": ["fable", "opus", "sonnet", "haiku"],
                "efforts": ["low", "medium", "high", "xhigh", "max"]},
     "codex": {"models": [], "efforts": ["minimal", "low", "medium", "high", "xhigh"]},
+    # omp's effort is its thinking level.
+    "omp": {"models": [], "efforts": ["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]},
 }
-SERVICE_NAMES = {"claude": "Claude", "codex": "Codex", "ollama": "Ollama (local)",
+SERVICE_NAMES = {"claude": "Claude", "codex": "Codex", "omp": "OMP", "ollama": "Ollama (local)",
                  "lmstudio": "LM Studio (local)", "other": "Other"}
 
 
@@ -686,34 +688,93 @@ def deliver_loop(settings):
         time.sleep(3)
 
 
+OMP_TTL = 600
+omp_cache = {"at": 0.0, "models": [], "approval": None}
+omp_lock = threading.Lock()
+
+
+def omp_info():
+    """omp's usable models and default approval mode. Asking omp takes seconds, so cache it."""
+    with omp_lock:
+        if time.time() - omp_cache["at"] > OMP_TTL:
+            models, approval = [], None
+            if omp := shutil.which("omp"):
+                run = lambda *args: subprocess.run([omp, *args], capture_output=True, text=True, timeout=30,
+                                                   check=True, stdin=subprocess.DEVNULL).stdout
+                try:
+                    models = sorted(m["selector"] for m in json.loads(run("models", "--json"))["models"]
+                                    if m.get("kind") == "chat")
+                    approval = run("config", "get", "tools.approvalMode").strip() or None
+                except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+                    pass
+            # After a failure, ask again in a minute instead of waiting out the TTL.
+            omp_cache.update(at=time.time() - (0 if models else OMP_TTL - 60), models=models, approval=approval)
+        return dict(omp_cache)
+
+
+def config_value(path, key):
+    """A top-level setting from an agent's JSON or TOML config file, or None."""
+    try:
+        text = path.read_text()
+        return (json.loads(text) if path.suffix == ".json" else tomllib.loads(text)).get(key)
+    except (OSError, ValueError):  # a missing, unreadable or malformed file just has no default
+        return None
+
+
+def omp_default_model():
+    try:
+        text = (Path.home() / ".omp" / "agent" / "config.yml").read_text()
+    except OSError:
+        return None
+    m = re.search(r"^modelRoles:\n(?:[ \t]+\S.*\n)*?[ \t]+default:[ \t]*(\S+)", text, re.M)
+    return m.group(1).strip("'\"") if m else None
+
+
 def model_suggestions():
-    """Models the inbox offers per agent kind: the fixed Claude aliases, and Codex models seen."""
+    """What the New agent and Settings forms offer per agent kind: models, efforts, modes, and
+    what "default" stands for where it can be read from the agent's own config."""
+    codex_conf = Path.home() / ".codex"
     seen = {m for p in THREADS_DIR.glob("*.json")
             if (u := json.loads(p.read_text()).get("usage") or {}).get("kind") == "codex"
             and (m := u.get("model"))}
+    codex_default = config_value(codex_conf / "config.toml", "model")
+    if codex_default:
+        seen.add(codex_default)
     try:
-        seen.add(tomllib.loads((Path.home() / ".codex" / "config.toml").read_text())["model"])
-    except (OSError, KeyError, tomllib.TOMLDecodeError):
+        seen |= {m["slug"] for m in json.loads((codex_conf / "models_cache.json").read_text())["models"]
+                 if m.get("visibility") == "list"}
+    except (OSError, ValueError, KeyError, TypeError):
         pass
-    return {"claude": CHOICES["claude"],
-            "codex": {"models": sorted(seen), "efforts": CHOICES["codex"]["efforts"]}}
+    omp = omp_info()
+    models = {"claude": CHOICES["claude"]["models"], "codex": sorted(seen), "omp": omp["models"]}
+    defaults = {"claude": {"model": config_value(Path.home() / ".claude" / "settings.json", "model")},
+                "codex": {"model": codex_default},
+                "omp": {"model": omp_default_model(), "mode": omp["approval"]}}
+    return {k: {"models": models[k], "efforts": CHOICES[k]["efforts"], "default": defaults[k],
+                "modes": [{"id": m, "label": l} for m, l in start_modes(k).items()]}
+            for k in CHOICES}
 
 
 def check_choice(kind, model, effort):
     """An error message if model or effort doesn't suit the agent kind."""
     if kind not in CHOICES:
-        return "Only Claude and Codex agents have model settings."
+        return "Only Claude, Codex and omp agents have model settings."
     if effort and effort not in CHOICES[kind]["efforts"]:
         return "Unknown effort."
     if model and (model not in CHOICES[kind]["models"] if kind == "claude"
-                  else not re.fullmatch(r"[A-Za-z0-9._:/-]{1,64}", model)):
+                  else not re.fullmatch(r"[A-Za-z0-9._:/~-]{1,64}", model)):
         return "Unknown model."
     return None
 
 
-def agent_flags(kind, model, effort):
+def agent_flags(kind, model, effort, mode=""):
+    """Command-line flags for a model, effort and (omp only) approval mode; Claude and Codex
+    modes are switched in their terminals after they start."""
     if kind == "claude":
         return (["--model", model] if model else []) + (["--effort", effort] if effort else [])
+    if kind == "omp":
+        return (["--model", model] if model else []) + (["--thinking", effort] if effort else []) + \
+               ([f"--approval-mode={mode}"] if mode else [])
     return (["-m", model] if model else []) + \
            (["-c", f'model_reasoning_effort="{effort}"'] if effort else [])
 
@@ -845,7 +906,7 @@ def launch_agent(settings, meta, cmd, prompt):
         wait_ready(settings, pane, 60, kind)
         herdr(settings, "agent", "rename", pane, name, timeout=10)
         update_thread(tid, lambda m: m["herdr"].update(agent=name))
-        if meta.get("mode") in MODES[kind]:
+        if meta.get("mode") in MODES.get(kind, {}):
             try:
                 switch_mode(settings, meta, meta["mode"])
             except HerdrError as err:
@@ -873,8 +934,9 @@ def restart_agent(settings, tid, model, effort):
     launching.add(tid)
     try:
         stop_agent(settings, meta)
-        cmd = ["claude", "--resume", sid] if kind == "claude" else ["codex", "resume", sid]
-        launch_agent(settings, meta, cmd + agent_flags(kind, model, effort),
+        cmd = {"claude": ["claude", "--resume", sid], "codex": ["codex", "resume", sid],
+               "omp": ["omp", f"--resume={sid}"]}[kind]
+        launch_agent(settings, meta, cmd + agent_flags(kind, model, effort, meta.get("mode") or ""),
                      f"dawg inbox: this session was restarted to switch to {label}. Background "
                      f"commands such as a pending dawg ask or dawg inbox -w were stopped, and open "
                      f"questions in your thread ({tid}) were closed. Carry on with your task, and "
@@ -909,7 +971,7 @@ def clear_agent(settings, tid):
         post(tid, {"kind": "clear", "from": "system", "body": "Context cleared"},
              lambda m: m.update(delivered=m["seq"], status="idle",
                                 usage={**kept, "context_pct": 0, "at": time.time()}))
-        launch_agent(settings, meta, [kind, *agent_flags(kind, model or "", effort)],
+        launch_agent(settings, meta, [kind, *agent_flags(kind, model or "", effort, meta.get("mode") or "")],
                      agent_prompt(kind, tid))
     except (HerdrError, KeyError, TypeError) as err:
         post(tid, {"kind": "system", "from": "system", "body": f"Couldn't clear the agent: {err}"})
@@ -932,6 +994,18 @@ MODES = {
 }
 # Modes the inbox offers; Claude has bypass only when started with it.
 MODE_CHOICES = {"claude": ["auto", "default", "acceptEdits", "plan"], "codex": ["default", "plan"]}
+# omp has no footer mode to read or shift+tab through; its approval mode is a launch flag instead.
+LAUNCH_MODES = {"omp": {"always-ask": "Ask (reads auto-approved)", "always-ask-cached": "Ask and remember",
+                        "write": "Auto-approve writes", "yolo": "Auto-approve all"}}
+
+
+def start_modes(kind):
+    """{id: label} of the modes the New agent form offers for an agent kind."""
+    if kind in MODE_CHOICES:
+        return {m: MODES[kind][m] for m in MODE_CHOICES[kind]}
+    return LAUNCH_MODES.get(kind, {})
+
+
 CLAUDE_FOOTER = {"auto mode": "auto", "manual mode": "default", "accept edits": "acceptEdits",
                  "plan mode": "plan", "bypass permissions": "bypassPermissions"}
 MENU_ITEM = re.compile(r"^\s*([❯›]\s*)?(\d)\.\s+(\S.*?)\s*$")
@@ -1103,7 +1177,7 @@ def watch(settings):
         meta = json.loads(p.read_text())
         tid, kind, h = meta["id"], thread_agent(meta).get("kind"), meta.get("herdr") or {}
         # An archived thread is still watched until its open prompt closes.
-        if ((meta.get("archived") and not meta.get("prompt")) or kind not in AGENT_KINDS
+        if ((meta.get("archived") and not meta.get("prompt")) or kind not in MODES  # no omp menus
                 or not h.get("pane") or tid in stopping or tid in choosing):
             continue
         menu = None
@@ -1180,6 +1254,8 @@ def choose(settings, meta, pid, n, text):
 def trust_folder(kind, cwd):
     """Mark cwd trusted for the agent kind, so it starts without asking in its terminal."""
     cwd = str(Path(cwd).resolve())
+    if kind == "omp":  # no trust file to write; any prompt of its own shows up in Terminal
+        return
     if kind == "claude":
         path = Path.home() / ".claude.json"
         data = json.loads(path.read_text()) if path.exists() else {}
@@ -1222,9 +1298,13 @@ def inbox_waiting(tid):
         return False
 
 
+# How each agent kind is told to use the dawg skill.
+SKILL_REF = {"claude": "/dawg", "codex": "the dawg skill ($dawg)", "omp": "the dawg skill (skill://dawg)"}
+
+
 def inbox_prompt(kind, tid, text):
     """A message from the inbox, typed into the agent's terminal."""
-    skill = "/dawg" if kind == "claude" else "the dawg skill ($dawg)"
+    skill = SKILL_REF[kind]
     return (f"[dawg inbox · thread {tid}] The user sent this from the dawg inbox, not the "
             f"terminal: stay in away mode (enter it with {skill} if you aren't in it) and reply "
             f"through dawg.\n\n{text}")
@@ -1278,7 +1358,7 @@ def agent_prompt(kind, tid, task=None):
                  f"Go straight into away mode and ask what to work on.")
     if kind == "claude":
         return f"/dawg {intro}"
-    return f"Use the dawg skill ($dawg). {intro}"
+    return f"Use {SKILL_REF[kind]}. {intro}"
 
 
 def prompt_when_ready(settings, pane, kind, prompt, note, prepare=None):
@@ -1327,15 +1407,22 @@ def start_agent(settings, tid, cwd, kind, task, model="", effort="", trust=False
         def placed(m):
             m["herdr"].update(workspace=wid, pane=pane)
         update_thread(tid, placed)
-        flags = agent_flags(kind, model, effort)
-        try:
-            herdr(settings, "agent", "start", name, "--kind", kind, "--pane", pane,
-                  "--timeout", "120000", *(["--", *flags] if flags else []), timeout=150)
-        except HerdrError as err:
-            if err.code != "agent_not_ready":
-                raise
-            note("The agent is waiting at a prompt in its terminal, such as whether to trust "
-                 "this folder. Answer it here or from Terminal; the task goes in once it's ready.")
+        flags = agent_flags(kind, model, effort, mode)
+        shell_deadline = time.time() + 30
+        while True:
+            try:
+                herdr(settings, "agent", "start", name, "--kind", kind, "--pane", pane,
+                      "--timeout", "120000", *(["--", *flags] if flags else []), timeout=150)
+            except HerdrError as err:
+                # A new pane's shell may not be at its prompt yet (slow shell startup).
+                if err.code == "agent_pane_busy" and time.time() < shell_deadline:
+                    time.sleep(1)
+                    continue
+                if err.code != "agent_not_ready":
+                    raise
+                note("The agent is waiting at a prompt in its terminal, such as whether to trust "
+                     "this folder. Answer it here or from Terminal; the task goes in once it's ready.")
+            break
 
         def set_mode():
             try:
@@ -1345,7 +1432,7 @@ def start_agent(settings, tid, cwd, kind, task, model="", effort="", trust=False
                     raise
                 note(f"Couldn't start it in {MODES[kind][mode]} mode: {err}")
         prompt_when_ready(settings, pane, kind, agent_prompt(kind, tid, task), note,
-                          set_mode if mode else None)
+                          set_mode if mode and kind in MODES else None)
         note(f"Started {kind} as {name} in herdr workspace {wid}.")
     except (HerdrError, KeyError, TypeError) as err:
         note(f"Couldn't start the agent: {err}")
@@ -1400,6 +1487,23 @@ def result_block(result):
     cls = "ok" if result["ok"] else "bad"
     return (f'<p class="{cls}">Action <b>{e(result["action"])}</b>: {e(result["status"])}</p>'
             f'<pre>{e(result["output"])}</pre>')
+
+
+def resolve_dir(raw):
+    """The path a user typed or picked; ~ and relative paths count from home."""
+    return Path(os.path.normpath(Path.home() / Path(raw.strip() or "~").expanduser()))
+
+
+def list_dirs(raw):
+    """The folders inside a directory, for the New agent form's picker. A path that isn't a directory
+    falls back to its nearest parent that is, so a half-typed path still browses."""
+    p = resolve_dir(raw)
+    while not p.is_dir():
+        p = p.parent
+    with os.scandir(p) as it:
+        names = sorted((d.name for d in it if d.is_dir() and not d.name.startswith(".")), key=str.lower)
+    return {"path": str(p), "parent": str(p.parent) if p.parent != p else None,
+            "dirs": [{"name": n, "path": str(p / n)} for n in names]}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1538,11 +1642,12 @@ class Handler(BaseHTTPRequestHandler):
                     meta["state"] = "idle"
             meta["service"] = thread_service(meta)
             meta["agent_kind"] = thread_agent(meta).get("kind")
-            meta["mode_label"] = MODES.get(meta["agent_kind"], {}).get(meta.get("mode"))
+            labels = MODES.get(meta["agent_kind"]) or LAUNCH_MODES.get(meta["agent_kind"], {})
+            meta["mode_label"] = labels.get(meta.get("mode"))
             threads.append(meta)
         threads.sort(key=lambda m: m["updated"], reverse=True)
         out = {"threads": threads, "now": time.time(), "kinds": list(AGENT_KINDS),
-               "keys": list(HERDR_KEYS), "choices": model_suggestions(),
+               "keys": list(HERDR_KEYS),
                "modes": {k: [{"id": m, "label": MODES[k][m]} for m in ms] for k, ms in MODE_CHOICES.items()},
                "herdr": bool(HERDR) and not scope, "scope": scope,
                "services": load_usage().get("services") if not scope else None,
@@ -1578,6 +1683,13 @@ class Handler(BaseHTTPRequestHandler):
         settings = self.server.settings
         if scope and (name in ("start", "herdr") or data.get("thread") != scope):
             return self.send_json({"error": "Open your inbox bookmark to do that."}, 403)
+        if name == "choices":
+            return self.send_json(model_suggestions())
+        if name == "dirs":
+            try:
+                return self.send_json(list_dirs(str(data.get("path", ""))))
+            except OSError as err:
+                return self.send_json({"error": f"Can't read that folder: {err.strerror}"}, 403)
         if name == "start":
             return self.api_start(data)
         tid = str(data.get("thread", ""))
@@ -1639,7 +1751,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"error": "Unknown call."}, 404)
 
     def api_start(self, data):
-        cwd = Path(str(data.get("cwd", "")).strip() or "~").expanduser()
+        cwd = resolve_dir(str(data.get("cwd", "")))
         kind = data.get("kind", "claude")
         task = str(data.get("task", "")).strip()
         if not HERDR:
@@ -1654,12 +1766,12 @@ class Handler(BaseHTTPRequestHandler):
         if err := check_choice(kind, model, effort):
             return self.send_json({"error": err}, 400)
         mode = data.get("mode") or ""
-        if mode and mode not in MODE_CHOICES[kind]:
+        if mode and mode not in start_modes(kind):
             return self.send_json({"error": "Unknown mode."}, 400)
         title = str(data.get("title", "")).strip()[:60] or cwd.name or str(cwd)
         tid = secrets.token_hex(6)
         new_thread(title, cwd=str(cwd), tid=tid, herdr={"agent": f"dawg-{tid}", "kind": kind})
-        update_thread(tid, lambda m: m.update(agent={"kind": kind}))
+        update_thread(tid, lambda m: m.update(agent={"kind": kind}, **({"mode": mode} if kind in LAUNCH_MODES else {})))
         post(tid, {"kind": "text", "from": "user", "body": task}, lambda m: m.update(
             status="busy", delivered=m["seq"]))
         threading.Thread(target=start_agent, args=(self.server.settings, tid, str(cwd), kind, task,
@@ -1698,8 +1810,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not (meta.get("usage") or {}).get("session_id"):
                     return self.send_json({"error": "Its session isn't known yet: Claude agents "
                                                     "report it through `dawg statusline` (install.sh "
-                                                    "sets it up), Codex agents once they've run a dawg "
-                                                    "command."}, 400)
+                                                    "sets it up), Codex and omp agents once they've "
+                                                    "run a dawg command."}, 400)
                 live = herdr_agents(settings).get(herdr_target(meta))
                 if not live or live["agent_status"] not in ("idle", "done"):
                     return self.send_json({"error": "Wait until the agent is idle in herdr."}, 409)
@@ -1708,7 +1820,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": True})
             if op == "mode":
                 kind, mode = thread_agent(meta).get("kind"), data.get("mode")
-                if kind not in AGENT_KINDS:
+                if kind not in MODES:
                     return self.send_json({"error": "Only Claude and Codex agents have modes."}, 400)
                 if meta.get("prompt"):
                     return self.send_json({"error": "Answer the prompt in its terminal first."}, 409)
@@ -1742,7 +1854,7 @@ class Handler(BaseHTTPRequestHandler):
                      lambda m: m.update(status="idle"))
                 return self.send_json({"ok": True})
             if op == "clear":
-                if thread_agent(meta).get("kind") not in AGENT_KINDS:
+                if thread_agent(meta).get("kind") not in MODES:
                     return self.send_json({"error": "Only Claude and Codex agents can be cleared."}, 400)
                 live = herdr_agents(settings).get(herdr_target(meta))
                 if not live or live["agent_status"] not in ("idle", "done"):
@@ -1876,6 +1988,7 @@ def serve(_args):
     srv = ThreadingHTTPServer((settings["bind"], settings["port"]), Handler)
     srv.settings = settings
     srv.token = get_token()
+    threading.Thread(target=omp_info, daemon=True).start()  # warm the cache the New agent form reads
     threading.Thread(target=poll_loop, args=(settings,), daemon=True).start()
     threading.Thread(target=deliver_loop, args=(settings,), daemon=True).start()
     threading.Thread(target=watch_loop, args=(settings,), daemon=True).start()
@@ -1993,8 +2106,16 @@ def thread_for(args):
     # Remember which Claude Code or Codex process this agent runs in, so its
     # usage reports reach this thread.
     kind, proc = agent_process()
+    # omp has no /proc entry to find on macOS, but its bash tool sets PI_SESSION_ID.
+    kind = kind or ("omp" if os.environ.get("PI_SESSION_ID") else None)
     if proc and tid != NOTIFICATIONS and thread_agent(meta).get("proc") != proc:
         meta = update_thread(tid, lambda m: m.update(agent={"kind": kind, "proc": proc}))
+    # omp's bash tool sets PI_SESSION_ID on every call, so a restart can resume the session.
+    sid = os.environ.get("PI_SESSION_ID")
+    if (sid and tid != NOTIFICATIONS and thread_agent(meta).get("kind") in (None, "omp")
+            and (meta.get("usage") or {}).get("session_id") != sid):
+        meta = update_thread(tid, lambda m: m.update(
+            usage={**(m.get("usage") or {}), "kind": "omp", "service": "omp", "session_id": sid}))
     # An agent running in herdr can be managed from the inbox through its pane.
     pane = os.environ.get("HERDR_PANE_ID") if os.environ.get("HERDR_ENV") == "1" else None
     if pane and tid != NOTIFICATIONS and (meta.get("herdr") or {}).get("pane") != pane:

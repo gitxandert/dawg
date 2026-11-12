@@ -9,6 +9,11 @@
 # When a `dawg ask` option has the same name as a key here, choosing it runs
 # that command. Any other option is just recorded as the answer.
 # Edits apply immediately; no restart needed.
+#
+# The examples below run on Linux. df -h works on Linux and macOS, but
+# GNU-only flags (df --output) and `free` don't exist on macOS: there, use
+# ["df", "-h", "/System/Volumes/Data"] for disk (/ is the sealed system
+# volume) and ["memory_pressure"] for memory.
 
 [action.ping]
 command = ["echo", "pong"]
@@ -21,7 +26,7 @@ description = "Uptime and load average"
 standing = true
 
 [action.disk]
-command = ["df", "-h", "--output=target,size,used,avail,pcent", "/", "/home"]
+command = ["df", "-h", "/", "/home"]
 description = "Disk usage for / and /home"
 standing = true
 
