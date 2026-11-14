@@ -234,7 +234,8 @@ def record_answers(rid, req, answers):
         def answered(meta):
             meta["open_asks"] = [r for r in meta["open_asks"] if r != rid]
             meta["status"] = "busy"  # the agent has its answer and is back at work
-        post(tid, {"kind": "answer", "from": "user", "rid": rid, "answers": answers}, answered)
+        post(tid, {"kind": "answer", "from": "user", "rid": rid, "answers": answers,
+                   "handoff": bool(req.get("handoff"))}, answered)
     return ans
 
 
@@ -408,12 +409,21 @@ def thread_status(meta):
     return meta["status"]
 
 
+def queued(entry):
+    """Whether a log entry is the user's, waiting for the agent: a message or a handoff answer."""
+    return entry["from"] == "user" and (
+        entry["kind"] == "text" or (entry["kind"] == "answer" and entry.get("handoff")))
+
+
+def queued_text(entry):
+    return entry["body"] if entry["kind"] == "text" else answer_prompt(entry)
+
+
 def take_queued(tid):
     """Return the user's messages the agent hasn't seen, and mark them delivered."""
     with thread_lock(tid):
         meta = json.loads(thread_path(tid).read_text())
-        msgs = [x for x in read_log(tid, meta["delivered"])
-                if x["from"] == "user" and x["kind"] == "text"]
+        msgs = [x for x in read_log(tid, meta["delivered"]) if queued(x)]
         meta["delivered"] = meta["seq"]
         write_json(thread_path(tid), meta)
     return msgs
@@ -421,8 +431,7 @@ def take_queued(tid):
 
 def queued_count(tid):
     meta = load_thread(tid)
-    return sum(1 for x in read_log(tid, meta["delivered"])
-               if x["from"] == "user" and x["kind"] == "text")
+    return sum(1 for x in read_log(tid, meta["delivered"]) if queued(x))
 
 
 
@@ -1230,6 +1239,18 @@ def inbox_prompt(kind, tid, text):
             f"through dawg.\n\n{text}")
 
 
+def answer_prompt(entry):
+    """Turn an async ask's answer log entry into a prompt for its agent."""
+    answers = entry["answers"]
+    parts = []
+    for answer in answers:
+        choice = answer["text"] if answer["option"] == MESSAGE else answer["option"]
+        if answer["option"] != MESSAGE and answer.get("text"):
+            choice += f"\n{answer['text']}"
+        parts.append(f"{answer['question']}\n{choice}" if len(answers) > 1 else choice)
+    return "\n\n".join(parts)
+
+
 def deliver(settings, tid):
     """Type the user's queued messages into the thread's herdr agent.
 
@@ -1243,16 +1264,15 @@ def deliver(settings, tid):
         if not meta or tid in launching or meta.get("prompt") or inbox_waiting(tid):
             return False
         kind, h = thread_agent(meta).get("kind"), meta.get("herdr") or {}
-        msgs = [x for x in read_log(tid, meta["delivered"])
-                if x["from"] == "user" and x["kind"] == "text"]
+        msgs = [x for x in read_log(tid, meta["delivered"]) if queued(x)]
         if not msgs or kind not in AGENT_KINDS or not h.get("pane"):
             return False
         live = herdr_agents(settings).get(herdr_target(meta))
         if not live or live.get("agent_status") not in ("idle", "done"):
             return False
         try:
-            submit_prompt(settings, herdr_target(meta),
-                          inbox_prompt(kind, tid, "\n\n".join(m["body"] for m in msgs)))
+            text = "\n\n".join(queued_text(m) for m in msgs)
+            submit_prompt(settings, herdr_target(meta), inbox_prompt(kind, tid, text))
         except HerdrError:
             return False
         seq = msgs[-1]["seq"]
@@ -1914,6 +1934,8 @@ def ask(args):
         sys.exit(f"dawg ask: set base_url in {SETTINGS_FILE} (run install.sh)")
     actions = load_actions()
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if args.handoff and args.wait:
+        sys.exit("dawg ask: use --handoff or --wait, not both")
     qs = read_questions(args)
     for q in qs:
         if not q["options"] and not args.text:
@@ -1923,10 +1945,14 @@ def ask(args):
         if MESSAGE in q["options"]:
             sys.exit(f"dawg ask: {MESSAGE!r} is reserved for free-text replies")
     meta = thread_for(args)
+    if args.handoff and (thread_agent(meta).get("kind") != "codex"
+                         or not (meta.get("herdr") or {}).get("pane")):
+        sys.exit("dawg ask: --handoff needs a Codex agent running in herdr")
     rid = secrets.token_hex(16)
     now = time.time()
     req = {"id": rid, "title": args.title, "questions": qs,
-           "allow_text": args.text, "created": now, "expires": now + args.expires}
+           "allow_text": args.text, "handoff": args.handoff,
+           "created": now, "expires": now + args.expires}
     req["thread"] = meta["id"]
     write_json(req_path(rid), req)
     first = qs[0]
@@ -2056,9 +2082,9 @@ def inbox_cmd(args):
             if args.wait and inbox_wait_path(meta["id"]).read_text() == str(os.getpid()):
                 inbox_wait_path(meta["id"]).unlink()
     if args.json:
-        print(json.dumps({"messages": [{"text": m["body"], "sent_at": m["ts"]} for m in msgs]}))
+        print(json.dumps({"messages": [{"text": queued_text(m), "sent_at": m["ts"]} for m in msgs]}))
     else:
-        print("\n\n".join(m["body"] for m in msgs))
+        print("\n\n".join(queued_text(m) for m in msgs))
     return 0
 
 
@@ -2129,6 +2155,8 @@ def main():
     a.add_argument("-g", "--group", default="dawgd")
     a.add_argument("-e", "--expires", type=int, default=3600, help="seconds (default 3600)")
     a.add_argument("-w", "--wait", action="store_true", help="block until answered; print the option")
+    a.add_argument("--handoff", action="store_true",
+                   help="deliver the answer as a new turn to this Codex agent in herdr")
     a.add_argument("--json", action="store_true", help="with --wait, print the full answer as JSON")
     a.add_argument("--text", action="store_true",
                    help=f"allow a typed reply: a note with an option, or option {MESSAGE!r} on its own")

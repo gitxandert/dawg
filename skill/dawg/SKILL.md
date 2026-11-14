@@ -71,6 +71,13 @@ You can't tell whether the user is at the terminal, so presence is explicit.
 Never infer it from screen lock or idle time: the desktop session reports
 locked while the user is active over SSH.
 
+Away mode is a continuing conversation, and dawg is the user's active channel.
+Do not put a progress update, question, completion report or final answer only
+in the terminal while the user is away. In interactive mode send user-facing
+messages with `dawg ask`; use `dawg status` for the inbox's live task note.
+The only terminal-only notices are failures that make dawg replies impossible,
+or an approval that cannot be surfaced through herdr.
+
 - **Enter** when the user says they're stepping away, asks you to text them,
   or invokes `/dawg`. If you have no task, ask what to work on (interactive)
   or send "Away mode on" (non-interactive). If you have a task, start on it.
@@ -83,8 +90,9 @@ locked while the user is active over SSH.
     something else. Then do what they pick.
   - On `That's all`, set your status to `idle` and wait for the inbox: run
     `dawg inbox -T <id> -w -e 14400` in the background. When it returns a
-    message, act on it as you would a reply. Away mode stays on until
-    they're back.
+    message, act on it as you would a reply. A Codex agent running in herdr
+    does not start this wait; set it idle and end the turn so dawgd can inject
+    the next inbox message. Away mode stays on until they're back.
 - **While away (non-interactive):** send one-way `dawg` messages for
   milestones and completion.
 - **Plan mode:** a phone reply can't take you out of plan mode. Only the
@@ -110,6 +118,22 @@ locked while the user is active over SSH.
 Outside away mode, use dawg only for one-off requests ("ping me when the
 build finishes"). Ask in that case too, unless the mode is non-interactive.
 
+### Codex reply delivery
+
+- **Codex in herdr (`HERDR_ENV=1`):** add `--handoff` and omit `-w --json`.
+  End the current turn without terminal-facing prose. When the user answers,
+  dawgd types it into the Codex pane as a new `[dawg inbox ...]` turn. Act on
+  it immediately and continue the ask/work/ask cycle. Do not poll or run
+  `dawg inbox -w`; either would prevent automatic delivery.
+- **Codex outside herdr:** use `-w --json` with a short exec yield and keep the
+  current turn alive by polling its session id with `write_stdin`. No output
+  means keep waiting. Poll `dawg inbox -w` the same way after `That's all`.
+- **Claude Code:** use `-w --json` with `run_in_background: true`; completion
+  wakes Claude automatically.
+
+Every returned or injected answer is a user instruction. Stay in away mode
+until the user explicitly returns or ends it.
+
 ## Check it works
 
 ```bash
@@ -125,13 +149,19 @@ Tell the user in the terminal instead of asking questions you can't receive.
 dawg ask -T <id> -t "<project>" -g claude --text -w --json -e 3600 "Question?" [OPTION..]
 ```
 
+For Codex running in herdr:
+
+```bash
+dawg ask -T <id> -t "<project>" -g codex --text --handoff -e 3600 "Question?" [OPTION..]
+```
+
 - Always pass `--text`. It adds a text box, plus a button for sending typed
   text as its own instruction: "Do this instead" when there are options,
   "Send" when there are none. Options are buttons, e.g.
   `"Push to GitHub" "Add tests" "That's all"`. Keep each label to a few words.
   With no options, the ask is a plain open question.
-- Run it with the Bash tool's `run_in_background: true`. A foreground call
-  would be killed after 10 minutes, and you're re-invoked when it exits.
+- Follow the runtime-specific delivery rule above. Never launch a wait and
+  assume Codex will be re-invoked when it exits.
 - On exit 0, stdout is JSON: `option` is the button tapped and `text` is what
   they typed. `option` is `"message"` when they sent their own instruction
   instead of picking one; follow `text` then. Otherwise `text` is an optional
