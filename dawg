@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dawg - send push notifications to the Bark iOS app.
+# dawg - send push notifications through Bark (iOS) or ntfy (Android).
 #
 # Usage:
 #   dawg [options] MESSAGE            send a message
@@ -16,15 +16,18 @@
 #               Notifications thread); the text links to it, and a thread
 #               muted in the inbox gets no texts
 #   -t TITLE    notification title (default: hostname)
-#   -g GROUP    group notifications in the app
+#   -g GROUP    group notifications in Bark; tag notifications in ntfy
 #   -l LEVEL    active | timeSensitive | passive | critical
-#   -s SOUND    sound name (e.g. alarm, bell, minuet)
+#   -s SOUND    Bark sound name (e.g. alarm, bell, minuet)
 #   -u URL      URL to open when tapped
 #   -a ACTION   Bark tap action; "none" makes tapping do nothing
 #
 # Config:
-#   DAWG_KEY     device key (or put it in ~/.config/dawg/key)
-#   DAWG_SERVER  server URL (default: https://api.day.app)
+#   DAWG_PROVIDER    bark (default) or ntfy; or ~/.config/dawg/provider
+#   DAWG_KEY         Bark device key or ntfy topic; or ~/.config/dawg/key
+#   DAWG_SERVER      server URL; or ~/.config/dawg/server
+#                    defaults: https://api.day.app (Bark), https://ntfy.sh (ntfy)
+#   DAWG_NTFY_TOKEN  optional ntfy access token; or ~/.config/dawg/ntfy_token
 
 set -u
 
@@ -32,13 +35,28 @@ dawgd="$(dirname "$(readlink -f "$0")")/dawgd.py"
 subcommand() { [[ "${1:-}" =~ ^(ask|status|inbox|thread|statusline)$ ]]; }
 subcommand "${1:-}" && exec python3 "$dawgd" "$@"
 
-server="${DAWG_SERVER:-https://api.day.app}"
-key="${DAWG_KEY:-}"
-if [[ -z "$key" && -r "$HOME/.config/dawg/key" ]]; then
-  key="$(tr -d '[:space:]' < "$HOME/.config/dawg/key")"
-fi
+config_value() {
+  local value="${!1:-}"
+  if [[ -z "$value" && -r "$HOME/.config/dawg/$2" ]]; then
+    value="$(tr -d '[:space:]' < "$HOME/.config/dawg/$2")"
+  fi
+  printf '%s' "${value:-${3:-}}"
+}
+
+provider="$(config_value DAWG_PROVIDER provider bark)"
+case "$provider" in
+  bark) default_server="https://api.day.app"; key_name="Bark device key" ;;
+  ntfy) default_server="https://ntfy.sh"; key_name="ntfy topic" ;;
+  *) echo "dawg: unknown provider '$provider'; use bark or ntfy" >&2; exit 2 ;;
+esac
+server="$(config_value DAWG_SERVER server "$default_server")"
+key="$(config_value DAWG_KEY key)"
 if [[ -z "$key" ]]; then
-  echo "dawg: no device key; set DAWG_KEY or write it to ~/.config/dawg/key" >&2
+  echo "dawg: no $key_name; set DAWG_KEY or write it to ~/.config/dawg/key" >&2
+  exit 2
+fi
+if [[ "$provider" == "ntfy" && ! "$key" =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+  echo "dawg: invalid ntfy topic; use letters, numbers, _ and -, up to 64 characters" >&2
   exit 2
 fi
 
@@ -54,7 +72,7 @@ while getopts ":T:t:g:l:s:u:a:h" opt; do
     s) sound="$OPTARG" ;;
     u) url="$OPTARG" ;;
     a) action="$OPTARG" ;;
-    h) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    h) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "dawg: bad option -$OPTARG" >&2; exit 2 ;;
   esac
 done
@@ -84,20 +102,39 @@ send() {
     python3 "$dawgd" send "${opts[@]}" -- "$body"
     return
   fi
-  local args=(-sS --max-time 10 -X POST "$server/$key"
-    --data-urlencode "title=$title"
-    --data-urlencode "body=$body")
-  [[ -n "$group" ]] && args+=(--data-urlencode "group=$group")
-  [[ -n "$level" ]] && args+=(--data-urlencode "level=$level")
-  [[ -n "$sound" ]] && args+=(--data-urlencode "sound=$sound")
-  [[ -n "$url"   ]] && args+=(--data-urlencode "url=$url")
-  [[ -n "$action" ]] && args+=(--data-urlencode "action=$action")
+  local args=(-sS --max-time 10 -X POST)
+  if [[ "$provider" == "ntfy" ]]; then
+    local payload token
+    payload="$(python3 - "$key" "$title" "$body" "$group" "$level" "$url" <<'PY'
+import json, sys
+topic, title, message, group, level, url = sys.argv[1:]
+payload = {"topic": topic, "title": title, "message": message}
+if group:
+    payload["tags"] = [group]
+if level:
+    payload["priority"] = {"passive": 2, "active": 3, "timeSensitive": 4, "critical": 5}.get(level, 3)
+if url:
+    payload["click"] = url
+print(json.dumps(payload))
+PY
+)" || return 1
+    args+=(--fail "${server%/}/" -H "Content-Type: application/json" --data-binary "$payload")
+    token="$(config_value DAWG_NTFY_TOKEN ntfy_token)"
+    [[ -n "$token" ]] && args+=(-H "Authorization: Bearer $token")
+  else
+    args+=("${server%/}/$key" --data-urlencode "title=$title" --data-urlencode "body=$body")
+    [[ -n "$group" ]] && args+=(--data-urlencode "group=$group")
+    [[ -n "$level" ]] && args+=(--data-urlencode "level=$level")
+    [[ -n "$sound" ]] && args+=(--data-urlencode "sound=$sound")
+    [[ -n "$url"   ]] && args+=(--data-urlencode "url=$url")
+    [[ -n "$action" ]] && args+=(--data-urlencode "action=$action")
+  fi
   local resp
   if ! resp="$(curl "${args[@]}")"; then
     echo "dawg: request failed" >&2
     return 1
   fi
-  if [[ "$resp" != *'"code":200'* ]]; then
+  if [[ "$provider" == "bark" && "$resp" != *'"code":200'* ]]; then
     echo "dawg: server error: $resp" >&2
     return 1
   fi

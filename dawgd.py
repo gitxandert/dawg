@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dawgd - reply to Bark notifications from your phone.
+"""dawgd - reply to push notifications from your phone.
 
 Subcommands:
   dawgd.py serve                     run the reply server (Tailscale-only)
@@ -121,7 +121,7 @@ def get_token():
 
 
 def notify(title, body, url=None, group="dawgd", level=None, sound=None):
-    """Send a text. Without a url, tapping it does nothing (Bark's action=none)."""
+    """Send a text; only attach a browser link when a URL is supplied."""
     cmd = [DAWG, "-t", title, "-g", group]
     for flag, value in (("-u", url), ("-a", None if url else "none"), ("-l", level), ("-s", sound)):
         if value:

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh - install dawg, dawgd and the agent skill for the current user.
 #
-# Usage: ./install.sh [--no-service]
+# Usage: ./install.sh [--no-service] [--provider bark|ntfy]
 #
 # Links dawg into ~/.local/bin and the skill into ~/.claude/skills, creates
 # per-user config in ~/.config/dawg (never overwriting existing files), and
@@ -12,7 +12,39 @@ set -euo pipefail
 repo="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 config="$HOME/.config/dawg"
 service=1
-[[ "${1:-}" == "--no-service" ]] && service=0
+provider="${DAWG_PROVIDER:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-service) service=0; shift ;;
+    --provider)
+      if [[ $# -lt 2 ]]; then
+        echo "install.sh: --provider needs bark or ntfy" >&2
+        exit 2
+      fi
+      provider="$2"; shift 2 ;;
+    *) echo "Usage: $0 [--no-service] [--provider bark|ntfy]" >&2; exit 2 ;;
+  esac
+done
+if [[ -e "$config/provider" ]]; then
+  saved_provider="$(tr -d '[:space:]' < "$config/provider")"
+  saved_provider="${saved_provider:-bark}"
+  if [[ -n "$provider" && "$provider" != "$saved_provider" ]]; then
+    echo "install.sh: $config/provider already selects $saved_provider; update it and $config/key to switch providers" >&2
+    exit 2
+  fi
+  provider="$saved_provider"
+fi
+provider="${provider:-bark}"
+case "$provider" in
+  bark) key_name="Bark device key (from the Bark app)" ;;
+  ntfy) key_name="ntfy topic (subscribe to the same topic in the ntfy app)" ;;
+  *) echo "install.sh: unknown provider '$provider'; use bark or ntfy" >&2; exit 2 ;;
+esac
+# An old install has a key but no provider file: that key is for Bark.
+if [[ ! -e "$config/provider" && -s "$config/key" && "$provider" != "bark" ]]; then
+  echo "install.sh: $config/key exists without $config/provider, so it is a Bark key; write $config/provider and update $config/key to switch to $provider" >&2
+  exit 2
+fi
 
 link() {  # link TARGET NAME: point NAME at TARGET, replacing an old symlink
   mkdir -p "$(dirname "$2")"
@@ -31,9 +63,14 @@ link "$repo/skill/dawg" "$HOME/.claude/skills/dawg"
 mkdir -p "$config"
 chmod 700 "$config"
 
+if [[ ! -e "$config/provider" ]]; then
+  (umask 077; printf '%s\n' "$provider" > "$config/provider")
+  echo "wrote $config/provider"
+fi
+
 if [[ ! -s "$config/key" ]]; then
   if [[ -t 0 ]]; then
-    read -rsp "Bark device key (from the Bark app; blank to skip): " key; echo
+    read -rsp "$key_name; blank to skip: " key; echo
   else
     key=""
   fi
@@ -41,7 +78,7 @@ if [[ ! -s "$config/key" ]]; then
     (umask 077; printf '%s\n' "$key" > "$config/key")
     echo "wrote $config/key"
   else
-    echo "note: no device key; write it to $config/key or set DAWG_KEY" >&2
+    echo "note: no $key_name; write it to $config/key or set DAWG_KEY" >&2
   fi
 fi
 
