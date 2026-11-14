@@ -1376,7 +1376,7 @@ def start_agent(settings, tid, cwd, kind, task, model="", effort="", trust=False
 # ---------------------------------------------------------------- web
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,minimum-scale=1,maximum-scale=1,user-scalable=no">
 <title>{title}</title><style>
 :root{{--bg:#f5f5f7;--card:#fff;--fg:#1d1d1f;--muted:#6e6e73;--accent:#0a66d8;--ok:#1a7f37;--bad:#c62828}}
 @media (prefers-color-scheme:dark){{:root{{--bg:#000;--card:#1c1c1e;--fg:#f5f5f7;--muted:#98989d;--accent:#3d8bfd;--ok:#3fb950;--bad:#f85149}}}}
